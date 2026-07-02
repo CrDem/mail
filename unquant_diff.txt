@@ -1,0 +1,19 @@
+use_fused_triton = (
+            original_dtype == torch.float16
+            and not self.with_bias
+            and self.moe_runner_config.activation == "silu"
+            and self.moe_runner_config.gemm1_clamp_limit is None
+        )
+
+        if use_fused_triton:
+            from sglang.srt.layers.moe.fused_moe_triton.fused_swiglu_mlp import (
+                fused_moe_mlp,
+            )
+
+            hidden_states = fused_moe_mlp(
+                hidden_states,
+                layer.w13_weight,
+                layer.w2_weight,
+                expert_tokens,
+            )
+        else:
