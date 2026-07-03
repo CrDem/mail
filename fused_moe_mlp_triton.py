@@ -81,7 +81,7 @@ def _fused_moe_mlp_kernel(
 
         # SwiGLU
         silu_gate = acc_gate * tl.sigmoid(acc_gate)
-        hidden_chunk = (silu_gate * acc_up).to(tl.float16)  # (BLOCK_M, BLOCK_N)
+        hidden_chunk = (silu_gate * acc_up) # (BLOCK_M, BLOCK_N)
 
         # gmm2
         w2_ptrs = (
@@ -91,10 +91,10 @@ def _fused_moe_mlp_kernel(
         )
         w2_tile = tl.load(w2_ptrs, mask=n_mask[None, :], other=0.0)  # (H, BLOCK_N)
 
-        acc_out = tl.dot(hidden_chunk, tl.trans(w2_tile), acc_out)
+        acc_out = tl.dot(hidden_chunk.to(w2_tile.dtype), tl.trans(w2_tile), acc_out)
 
     out_ptrs = out_ptr + rows[:, None] * stride_om + offs_hout[None, :] * stride_on
-    tl.store(out_ptrs, acc_out.to(tl.float16), mask=m_mask[:, None])
+    tl.store(out_ptrs, acc_out.to(out_ptr.dtype.element_ty), mask=m_mask[:, None])
 
 
 def build_tile_schedule(
@@ -135,21 +135,15 @@ def build_tile_schedule(
     )
 
 
-# НИЖЕ ВАЙБКОД ДЛЯ ТЕСТА
-
-# ----------------------------------------------------------------------
-# 3. Хостовая обёртка: строит расписание (без sync) и запускает кернел
-# ----------------------------------------------------------------------
 def fused_moe_mlp(
-    x: torch.Tensor,            # (num_tokens, hidden_size), fp16, отсортирован по экспертам
-    w13: torch.Tensor,          # (num_experts, 2*inter_size, hidden_size), fp16
-    w2: torch.Tensor,           # (num_experts, hidden_size, inter_size), fp16
-    group_sizes: torch.Tensor,  # (num_experts,) int, сколько токенов у каждого эксперта
+    x: torch.Tensor,            # (num_tokens, hidden_size),
+    w13: torch.Tensor,          # (num_experts, 2*inter_size, hidden_size),
+    w2: torch.Tensor,           # (num_experts, hidden_size, inter_size),
+    group_sizes: torch.Tensor,  # (num_experts,) int
     BLOCK_M: int = 32,
     BLOCK_N: int = 64,
     BLOCK_K: int = 32,
 ) -> torch.Tensor:
-    assert x.dtype == torch.float16 and w13.dtype == torch.float16 and w2.dtype == torch.float16
     num_tokens, hidden_size = x.shape
     num_experts, up_dim, _ = w13.shape
     inter_size = up_dim // 2
@@ -178,8 +172,9 @@ def fused_moe_mlp(
     return out
 
 
+# НИЖЕ ВАЙБКОД ДЛЯ ТЕСТА
 # ----------------------------------------------------------------------
-# 4. Референс на чистом torch + самотест
+# Референс на чистом torch + самотест
 # ----------------------------------------------------------------------
 def reference_moe_mlp(x, w13, w2, group_sizes):
     """То же самое, что делал старый код: grouped_matmul -> swiglu -> grouped_matmul,
