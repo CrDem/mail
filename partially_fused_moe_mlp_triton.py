@@ -27,12 +27,12 @@ def _grouped_gemm1_swiglu_kernel(
 
     offs_m = tl.arange(0, BLOCK_M)
     m_mask = offs_m < row_count
-    rows = row_start + offs_m
+    rows = tl.cast(row_start + offs_m, tl.int64)
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < inter_size
 
-    w13_base = w13_ptr + expert_id * stride_w13_e
+    w13_base = w13_ptr + tl.cast(expert_id, tl.int64) * stride_w13_e
 
     acc_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     acc_up = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -77,8 +77,8 @@ def _grouped_gemm2_kernel(
     stride_w2_e, stride_w2_n, stride_w2_k,
     stride_om, stride_on,
     BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,   # тайл по hidden_size (выход gmm2)
-    BLOCK_K: tl.constexpr,   # тайл-редукция по inter_size
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -91,12 +91,12 @@ def _grouped_gemm2_kernel(
 
     offs_m = tl.arange(0, BLOCK_M)
     m_mask = offs_m < row_count
-    rows = row_start + offs_m
+    rows = tl.cast(row_start + offs_m, tl.int64)
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < hidden_size
 
-    w2_base = w2_ptr + expert_id * stride_w2_e
+    w2_base = w2_ptr + tl.cast(expert_id, tl.int64) * stride_w2_e
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
@@ -129,7 +129,7 @@ def build_tile_schedule(group_sizes: torch.Tensor, num_tokens: int, BLOCK_M: int
     tiles_cumsum = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
     tiles_cumsum[1:] = torch.cumsum(tiles_per_expert, dim=0)
 
-    grid_size = int(num_experts.sum())
+    grid_size = int(tiles_per_expert.sum())
 
     tile_idx = torch.arange(grid_size, device=device, dtype=torch.int64)
     tile_expert = torch.searchsorted(tiles_cumsum[1:], tile_idx, right=True)
@@ -193,6 +193,7 @@ def fused_moe_mlp(
         out.stride(0), out.stride(1),
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
     )
+
     return out
 
 
