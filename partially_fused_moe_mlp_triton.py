@@ -163,9 +163,16 @@ def fused_moe_mlp(
 
     print(w2.shape, w2.stride())
 
+    print(group_sizes.sum())
+    print(x.shape[0])
+    print(group_sizes.max())
+    print(group_sizes.min())
+    print(group_sizes.nonzero().shape)
+
     num_tokens, hidden_size = x.shape
     num_experts, up_dim, _ = w13.shape
     inter_size = up_dim // 2
+
 
     group_sizes = group_sizes.to(device=x.device)
     tile_expert_t, tile_row_start_t, tile_row_count_t, grid_m = build_tile_schedule(
