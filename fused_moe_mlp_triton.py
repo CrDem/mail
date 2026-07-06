@@ -120,8 +120,7 @@ def build_tile_schedule(
     tiles_cumsum = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
     tiles_cumsum[1:] = torch.cumsum(tiles_per_expert, dim=0)
 
-    # just upper bound for num programs
-    grid_size = triton.cdiv(num_tokens, BLOCK_M) + num_experts
+    grid_size = int(tiles_per_expert.sum().item())
 
     tile_idx = torch.arange(grid_size, device=device, dtype=torch.int64)
     tile_expert = torch.searchsorted(tiles_cumsum[1:], tile_idx, right=True)
@@ -137,9 +136,9 @@ def build_tile_schedule(
     tile_row_count = torch.where(valid, tile_row_count, torch.zeros_like(tile_row_count))
 
     return (
-        tile_expert.to(torch.int32),
-        tile_row_start.to(torch.int32),
-        tile_row_count.to(torch.int32),
+        tile_expert.to(torch.int64),
+        tile_row_start.to(torch.int64),
+        tile_row_count.to(torch.int64),
         grid_size,
     )
 
@@ -153,6 +152,16 @@ def fused_moe_mlp(
     BLOCK_N: int = 32,
     BLOCK_K: int = 32,
 ) -> torch.Tensor:
+    
+    print(f"w13.shape: {w13.shape}, w13.stride: {w13.stride()}")
+    print(f"w2.shape: {w2.shape}, w2.stride: {w2.stride()}")
+
+    print(f"group_sizes.sum(): {group_sizes.sum()}")
+    print(f"x.shape[0]: {x.shape[0]}")
+    print(f"group_sizes.max(): {group_sizes.max()}")
+    print(f"group_sizes.min(): {group_sizes.min()}")
+    print(f"group_sizes.nonzero().shape: {group_sizes.nonzero().shape}")
+
     num_tokens, hidden_size = x.shape
     num_experts, up_dim, _ = w13.shape
     inter_size = up_dim // 2
@@ -165,6 +174,18 @@ def fused_moe_mlp(
 
     device = x.device
     out = torch.empty((num_tokens, hidden_size), dtype=torch.float16, device=device)
+
+    assert int(group_sizes.sum()) == x.shape[0]
+
+    assert (tile_row_count_t >= 0).all()
+    assert (tile_row_count_t <= BLOCK_M).all()
+
+    assert (tile_row_start_t >= 0).all()
+
+    assert (
+        tile_row_start_t + tile_row_count_t
+        <= num_tokens
+    ).all()
 
     grid = (grid_size,)
     _fused_moe_mlp_kernel[grid](
