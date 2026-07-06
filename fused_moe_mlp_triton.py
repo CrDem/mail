@@ -18,7 +18,8 @@ def _fused_moe_mlp_kernel(
 
     BLOCK_M: tl.constexpr,      # rows per program
     BLOCK_N: tl.constexpr,      # intermediate-dim tile
-    BLOCK_K: tl.constexpr,      # hidden-dim tile (K for gemm1)
+    BLOCK_K: tl.constexpr,      # hidden-dim tile (K for gemm1, and now also
+                                # the output-dim tile for gemm2)
     HIDDEN_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -34,67 +35,75 @@ def _fused_moe_mlp_kernel(
     m_mask = offs_m < row_count
     rows = row_start + offs_m
 
-    offs_hout = tl.arange(0, HIDDEN_SIZE)
-    acc_out = tl.zeros((BLOCK_M, HIDDEN_SIZE), dtype=tl.float32)
-
     w13_base = w13_ptr + expert_id * stride_w13_e
     w2_base = w2_ptr + expert_id * stride_w2_e
 
-    # intermediate-dim tiling, tile size = BLOCK_N
-    for n0 in range(0, inter_size, BLOCK_N):
-        offs_n = n0 + tl.arange(0, BLOCK_N)
-        n_mask = offs_n < inter_size
+    for h0 in range(0, hidden_size, BLOCK_K):
+        offs_h = h0 + tl.arange(0, BLOCK_K)
+        h_mask = offs_h < hidden_size
 
-        acc_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        acc_up = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        acc_out = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
 
-        # hidden_size-dim tiling, tile size = BLOCK_K
-        for k0 in range(0, hidden_size, BLOCK_K):
-            offs_k = k0 + tl.arange(0, BLOCK_K)
-            k_mask = offs_k < hidden_size
+        # intermediate-dim tiling, tile size = BLOCK_N
+        for n0 in range(0, inter_size, BLOCK_N):
+            offs_n = n0 + tl.arange(0, BLOCK_N)
+            n_mask = offs_n < inter_size
 
-            x_ptrs = x_ptr + rows[:, None] * stride_xm + offs_k[None, :] * stride_xk
-            x_tile = tl.load(
-                x_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0
+            acc_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            acc_up = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+            # hidden_size-dim tiling, tile size = BLOCK_K (reduction for gemm1)
+            for k0 in range(0, hidden_size, BLOCK_K):
+                offs_k = k0 + tl.arange(0, BLOCK_K)
+                k_mask = offs_k < hidden_size
+
+                x_ptrs = x_ptr + rows[:, None] * stride_xm + offs_k[None, :] * stride_xk
+                x_tile = tl.load(
+                    x_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0
+                )
+
+                gate_ptrs = (
+                    w13_base
+                    + offs_n[:, None] * stride_w13_n
+                    + offs_k[None, :] * stride_w13_k
+                )
+                gate_w = tl.load(
+                    gate_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0
+                )
+
+                up_ptrs = (
+                    w13_base
+                    + (offs_n[:, None] + inter_size) * stride_w13_n
+                    + offs_k[None, :] * stride_w13_k
+                )
+                up_w = tl.load(
+                    up_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0
+                )
+
+                acc_gate = tl.dot(x_tile, tl.trans(gate_w), acc_gate)
+                acc_up = tl.dot(x_tile, tl.trans(up_w), acc_up)
+
+            # SwiGLU
+            silu_gate = acc_gate * tl.sigmoid(acc_gate)
+            hidden_chunk = (silu_gate * acc_up)  # (BLOCK_M, BLOCK_N)
+
+            # gmm2 (BLOCK_K, BLOCK_N)
+            w2_ptrs = (
+                w2_base
+                + offs_h[:, None] * stride_w2_n
+                + offs_n[None, :] * stride_w2_k
             )
+            w2_tile = tl.load(
+                w2_ptrs, mask=h_mask[:, None] & n_mask[None, :], other=0.0
+            )  # (BLOCK_K, BLOCK_N)
 
-            gate_ptrs = (
-                w13_base
-                + offs_n[:, None] * stride_w13_n
-                + offs_k[None, :] * stride_w13_k
-            )
-            gate_w = tl.load(
-                gate_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0
-            )
+            acc_out = tl.dot(hidden_chunk.to(w2_tile.dtype), tl.trans(w2_tile), acc_out)
 
-            up_ptrs = (
-                w13_base
-                + (offs_n[:, None] + inter_size) * stride_w13_n
-                + offs_k[None, :] * stride_w13_k
-            )
-            up_w = tl.load(
-                up_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0
-            )
-
-            acc_gate = tl.dot(x_tile, tl.trans(gate_w), acc_gate)
-            acc_up = tl.dot(x_tile, tl.trans(up_w), acc_up)
-
-        # SwiGLU
-        silu_gate = acc_gate * tl.sigmoid(acc_gate)
-        hidden_chunk = (silu_gate * acc_up) # (BLOCK_M, BLOCK_N)
-
-        # gmm2
-        w2_ptrs = (
-            w2_base
-            + offs_hout[:, None] * stride_w2_n
-            + offs_n[None, :] * stride_w2_k
+        out_ptrs = out_ptr + rows[:, None] * stride_om + offs_h[None, :] * stride_on
+        tl.store(
+            out_ptrs, acc_out.to(out_ptr.dtype.element_ty),
+            mask=m_mask[:, None] & h_mask[None, :],
         )
-        w2_tile = tl.load(w2_ptrs, mask=n_mask[None, :], other=0.0)  # (H, BLOCK_N)
-
-        acc_out = tl.dot(hidden_chunk.to(w2_tile.dtype), tl.trans(w2_tile), acc_out)
-
-    out_ptrs = out_ptr + rows[:, None] * stride_om + offs_hout[None, :] * stride_on
-    tl.store(out_ptrs, acc_out.to(out_ptr.dtype.element_ty), mask=m_mask[:, None])
 
 
 def build_tile_schedule(
@@ -141,7 +150,7 @@ def fused_moe_mlp(
     w2: torch.Tensor,           # (num_experts, hidden_size, inter_size),
     group_sizes: torch.Tensor,  # (num_experts,) int
     BLOCK_M: int = 32,
-    BLOCK_N: int = 64,
+    BLOCK_N: int = 32,
     BLOCK_K: int = 32,
 ) -> torch.Tensor:
     num_tokens, hidden_size = x.shape
