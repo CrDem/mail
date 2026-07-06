@@ -27,12 +27,12 @@ def _grouped_gemm1_swiglu_kernel(
 
     offs_m = tl.arange(0, BLOCK_M)
     m_mask = offs_m < row_count
-    rows = tl.cast(row_start + offs_m, tl.int64)
+    rows = row_start + offs_m
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < inter_size
 
-    w13_base = w13_ptr + tl.cast(expert_id, tl.int64) * stride_w13_e
+    w13_base = w13_ptr + expert_id * stride_w13_e
 
     acc_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     acc_up = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -91,12 +91,12 @@ def _grouped_gemm2_kernel(
 
     offs_m = tl.arange(0, BLOCK_M)
     m_mask = offs_m < row_count
-    rows = tl.cast(row_start + offs_m, tl.int64)
+    rows = row_start + offs_m
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < hidden_size
 
-    w2_base = w2_ptr + tl.cast(expert_id, tl.int64) * stride_w2_e
+    w2_base = w2_ptr + expert_id * stride_w2_e
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
@@ -142,9 +142,9 @@ def build_tile_schedule(group_sizes: torch.Tensor, num_tokens: int, BLOCK_M: int
     tile_row_count = torch.where(valid, tile_row_count, torch.zeros_like(tile_row_count))
 
     return (
-        tile_expert.to(torch.int32),
-        tile_row_start.to(torch.int32),
-        tile_row_count.to(torch.int32),
+        tile_expert.to(torch.int64),
+        tile_row_start.to(torch.int64),
+        tile_row_count.to(torch.int64),
         grid_size,
     )
 
@@ -159,15 +159,15 @@ def fused_moe_mlp(
     BLOCK_K: int = 32,
 ) -> torch.Tensor:
     
-    print(w13.shape, w13.stride())
+    print(f"w13.shape: {w13.shape}, w13.stride: {w13.stride()}")
 
-    print(w2.shape, w2.stride())
+    print(f"w2.shape: {w2.shape}, w2.stride: {w2.stride()}")
 
-    print(group_sizes.sum())
-    print(x.shape[0])
-    print(group_sizes.max())
-    print(group_sizes.min())
-    print(group_sizes.nonzero().shape)
+    print(f"group_sizes.sum(): {group_sizes.sum()}")
+    print(f"x.shape[0]: {x.shape[0]}")
+    print(f"group_sizes.max(): {group_sizes.max()}")
+    print(f"group_sizes.min(): {group_sizes.min()}")
+    print(f"group_sizes.nonzero().shape: {group_sizes.nonzero().shape}")
 
     num_tokens, hidden_size = x.shape
     num_experts, up_dim, _ = w13.shape
