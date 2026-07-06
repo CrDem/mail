@@ -129,7 +129,7 @@ def build_tile_schedule(group_sizes: torch.Tensor, num_tokens: int, BLOCK_M: int
     tiles_cumsum = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
     tiles_cumsum[1:] = torch.cumsum(tiles_per_expert, dim=0)
 
-    grid_size = int(tiles_per_expert.sum())
+    grid_size = int(tiles_per_expert.sum().item())
 
     tile_idx = torch.arange(grid_size, device=device, dtype=torch.int64)
     tile_expert = torch.searchsorted(tiles_cumsum[1:], tile_idx, right=True)
@@ -155,9 +155,14 @@ def fused_moe_mlp(
     w2: torch.Tensor,           # (num_experts, hidden_size, inter_size)
     group_sizes: torch.Tensor,  # (num_experts,) int
     BLOCK_M: int = 32,
-    BLOCK_N: int = 64,
+    BLOCK_N: int = 32,
     BLOCK_K: int = 32,
 ) -> torch.Tensor:
+    
+    print(w13.shape, w13.stride())
+
+    print(w2.shape, w2.stride())
+
     num_tokens, hidden_size = x.shape
     num_experts, up_dim, _ = w13.shape
     inter_size = up_dim // 2
@@ -169,6 +174,19 @@ def fused_moe_mlp(
 
     device = x.device
     hidden = torch.empty((num_tokens, inter_size), dtype=x.dtype, device=device)
+
+    print(hidden.stride())
+
+    assert int(group_sizes.sum()) == x.shape[0]
+    assert (tile_row_count_t >= 0).all()
+    assert (tile_row_count_t <= BLOCK_M).all()
+
+    assert (tile_row_start_t >= 0).all()
+
+    assert (
+        tile_row_start_t + tile_row_count_t
+        <= num_tokens
+    ).all()
 
     grid1 = (grid_m, triton.cdiv(inter_size, BLOCK_N))
     _grouped_gemm1_swiglu_kernel[grid1](
