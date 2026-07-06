@@ -1,15 +1,13 @@
-import time
-
 import torch
-import triton
+import traceback
+import time
 
 from fused_moe_mlp import fused_moe_mlp
 
 
-def run_case(hidden_size):
-    device = "cuda"
+def benchmark(hidden_size, inter_size):
+    device = torch.device("npu")
 
-    inter_size = hidden_size * 2
     num_experts = 128
 
     group_sizes = torch.zeros(num_experts, dtype=torch.int32, device=device)
@@ -19,27 +17,26 @@ def run_case(hidden_size):
     x = torch.randn(
         num_tokens,
         hidden_size,
-        device=device,
         dtype=torch.float16,
+        device=device,
     )
 
     w13 = torch.randn(
         num_experts,
-        inter_size * 2,
+        2 * inter_size,
         hidden_size,
-        device=device,
         dtype=torch.float16,
+        device=device,
     )
 
     w2 = torch.randn(
         num_experts,
         hidden_size,
         inter_size,
-        device=device,
         dtype=torch.float16,
+        device=device,
     )
 
-    # прогрев
     fused_moe_mlp(
         x,
         w13,
@@ -49,7 +46,9 @@ def run_case(hidden_size):
         BLOCK_N=32,
         BLOCK_K=32,
     )
-    torch.cuda.synchronize()
+
+    if hasattr(torch, "npu"):
+        torch.npu.synchronize()
 
     start = time.perf_counter()
 
@@ -63,43 +62,35 @@ def run_case(hidden_size):
         BLOCK_K=32,
     )
 
-    torch.cuda.synchronize()
+    if hasattr(torch, "npu"):
+        torch.npu.synchronize()
 
     end = time.perf_counter()
 
-    print(
-        f"hidden={hidden_size:<5d} "
-        f"OK "
-        f"time={(end-start)*1000:.3f} ms"
-    )
+    print(f"OK  hidden={hidden_size:<5} inter={inter_size:<5} {(end-start)*1000:.3f} ms")
 
 
 def main():
-    hidden_sizes = [
-        128,
-        256,
-        512,
-        1024,
-        1536,
-        2048,
-        2560,
-        3072,
-        4096,
+
+    cases = [
+        (128, 256),
+        (256, 512),
+        (512, 1024),
+        (1024, 2048),
+        (2048, 4096),
+        (2560, 6912),
+        (3072, 8192),
     ]
 
-    print("=" * 60)
-
-    for hidden in hidden_sizes:
-        print(f"Testing hidden={hidden}")
+    for hidden, inter in cases:
+        print("=" * 70)
+        print(f"Testing hidden={hidden}, inter={inter}")
 
         try:
-            run_case(hidden)
-
-        except Exception as e:
-            print(f"FAILED: {type(e).__name__}")
-            print(e)
-
-        print("-" * 60)
+            benchmark(hidden, inter)
+        except Exception:
+            traceback.print_exc()
+            break
 
 
 if __name__ == "__main__":
