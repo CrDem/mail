@@ -6,14 +6,32 @@ benchmark file — only imports from fused_moe_mlp.py and re-implements
 (verbatim copy) the NPU-native pipeline from the benchmark script, so
 this is a fully separate arbiter.
 
-Golden reference = reference_moe_mlp() already shipped inside
-fused_moe_mlp.py: all matmuls done in fp32, only the *final* output is
-rounded to fp16. That's the closest thing to "the true algorithm" we
-have available without a fp64/exact reference, since it minimizes the
-number of rounding points relative to both candidates.
+Golden reference is written FROM SCRATCH in this file (golden_moe_mlp_loop
+below) instead of reusing reference_moe_mlp() from fused_moe_mlp.py, since
+that one hasn't been touched in a while and could silently encode a stale
+tensor layout assumption. All matmuls in the golden path run in fp32, and
+only the *final* output is rounded to fp16 — that minimizes the number of
+rounding points relative to both candidates we're arbitrating between.
+
+Before trusting golden_moe_mlp_loop on the real benchmark sizes, main()
+runs a self-check: on a tiny synthetic case it cross-validates the
+loop-based golden implementation against an independently-written
+fully-vectorized (gather + bmm) implementation of the exact same layout
+assumption. If those two disagree, the layout assumption itself (or a
+loop/indexing bug) is wrong and the script aborts before comparing
+anything to it.
+
+Layout assumption (must match fused_moe_mlp.py / the NPU ops):
+  x   : (num_tokens, hidden_size), tokens grouped contiguously by expert,
+        expert 0's tokens first, then expert 1's, etc.
+  w13 : (num_experts, hidden_size, 2*inter_size)
+        w13[e, :, :inter_size]  = gate projection
+        w13[e, :, inter_size:]  = up projection
+  w2  : (num_experts, inter_size, hidden_size)
+  group_sizes : (num_experts,) int, token count routed to each expert
 
 For each test case we compute:
-  1. golden      = reference_moe_mlp(...)                (fp32 math)
+  1. golden      = golden_moe_mlp_loop(...)              (fp32 math, from scratch)
   2. triton_out  = fused_moe_mlp(...)                    (your kernel)
   3. npu_out     = npu_grouped_matmul + npu_swiglu + npu_grouped_matmul (Ascend native)
 
@@ -26,7 +44,115 @@ torch.ops.npu.npu_grouped_matmul / npu_swiglu registered).
 import traceback
 import torch
 
-from fused_moe_mlp import fused_moe_mlp, reference_moe_mlp as golden_reference_moe_mlp
+from fused_moe_mlp import fused_moe_mlp
+
+
+def golden_moe_mlp_loop(x, w13, w2, group_sizes):
+    """
+    From-scratch, pure fp32, loop-per-expert reference implementation.
+    See module docstring for the tensor layout this assumes.
+    """
+    num_tokens, hidden_size = x.shape
+    num_experts, w13_hidden, up_dim = w13.shape
+    inter_size = up_dim // 2
+
+    assert w13_hidden == hidden_size, (w13_hidden, hidden_size)
+    assert w2.shape == (num_experts, inter_size, hidden_size), (w2.shape, num_experts, inter_size, hidden_size)
+    assert group_sizes.numel() == num_experts, (group_sizes.numel(), num_experts)
+    assert int(group_sizes.sum().item()) == num_tokens, (int(group_sizes.sum().item()), num_tokens)
+
+    x_f32 = x.float()
+    w13_f32 = w13.float()
+    w2_f32 = w2.float()
+
+    out = torch.zeros(num_tokens, hidden_size, dtype=torch.float32, device=x.device)
+
+    row = 0
+    for e in range(num_experts):
+        n = int(group_sizes[e].item())
+        if n == 0:
+            continue
+
+        x_e = x_f32[row:row + n]                 # (n, hidden)
+        w_gate = w13_f32[e, :, :inter_size]       # (hidden, inter)
+        w_up = w13_f32[e, :, inter_size:]         # (hidden, inter)
+
+        gate = x_e @ w_gate                       # (n, inter)
+        up = x_e @ w_up                           # (n, inter)
+
+        silu_gate = gate * torch.sigmoid(gate)
+        hidden = silu_gate * up                   # (n, inter)
+
+        out[row:row + n] = hidden @ w2_f32[e]     # (n, hidden)
+
+        row += n
+
+    return out.to(x.dtype)
+
+
+def _golden_moe_mlp_vectorized_for_selfcheck(x, w13, w2, group_sizes):
+    """
+    Independent, fully-vectorized (gather + bmm) re-implementation of the
+    exact same layout assumption as golden_moe_mlp_loop, used ONLY to
+    cross-validate that function on a small synthetic case. Deliberately
+    memory-heavy (materializes a per-token weight tensor), so this must
+    NOT be called on the real benchmark sizes.
+    """
+    num_tokens, hidden_size = x.shape
+    num_experts, _, up_dim = w13.shape
+    inter_size = up_dim // 2
+
+    expert_id = torch.repeat_interleave(
+        torch.arange(num_experts, device=x.device), group_sizes.to(torch.int64)
+    )
+    assert expert_id.numel() == num_tokens
+
+    x_f32 = x.float()
+    w13_f32 = w13.float()
+    w2_f32 = w2.float()
+
+    w13_per_tok = w13_f32[expert_id]              # (num_tokens, hidden, 2*inter)
+    gate_up = torch.bmm(x_f32.unsqueeze(1), w13_per_tok).squeeze(1)  # (num_tokens, 2*inter)
+    gate, up = gate_up[:, :inter_size], gate_up[:, inter_size:]
+
+    silu_gate = gate * torch.sigmoid(gate)
+    hidden = silu_gate * up                       # (num_tokens, inter)
+
+    w2_per_tok = w2_f32[expert_id]                # (num_tokens, inter, hidden)
+    out = torch.bmm(hidden.unsqueeze(1), w2_per_tok).squeeze(1)      # (num_tokens, hidden)
+
+    return out.to(x.dtype)
+
+
+def self_check_golden_reference(device):
+    """
+    Cross-validates golden_moe_mlp_loop against an independently-written
+    vectorized implementation on a tiny synthetic case. Raises if they
+    disagree beyond fp32 numerical noise.
+    """
+    torch.manual_seed(1234)
+
+    num_experts = 5
+    hidden_size = 32
+    inter_size = 16
+    group_sizes = torch.tensor([7, 0, 13, 4, 9], dtype=torch.int64, device=device)
+    num_tokens = int(group_sizes.sum().item())
+
+    x = torch.randn(num_tokens, hidden_size, dtype=torch.float32, device=device)
+    w13 = torch.randn(num_experts, hidden_size, 2 * inter_size, dtype=torch.float32, device=device)
+    w2 = torch.randn(num_experts, inter_size, hidden_size, dtype=torch.float32, device=device)
+
+    out_loop = golden_moe_mlp_loop(x, w13, w2, group_sizes)
+    out_vec = _golden_moe_mlp_vectorized_for_selfcheck(x, w13, w2, group_sizes)
+
+    max_abs = (out_loop - out_vec).abs().max().item()
+    if max_abs > 1e-4:
+        raise RuntimeError(
+            f"golden_moe_mlp_loop self-check FAILED: max_abs diff vs independent "
+            f"vectorized implementation = {max_abs}. Do not trust the golden "
+            f"reference in this state — fix golden_moe_mlp_loop before continuing."
+        )
+    print(f"golden reference self-check OK (max_abs vs independent impl = {max_abs:.2e})")
 
 
 def npu_native_moe_mlp(x, w13, w2, expert_tokens):
