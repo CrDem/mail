@@ -129,7 +129,7 @@ def build_tile_schedule(group_sizes: torch.Tensor, num_tokens: int, BLOCK_M: int
     tiles_cumsum = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
     tiles_cumsum[1:] = torch.cumsum(tiles_per_expert, dim=0)
 
-    grid_size = int(tiles_per_expert.sum().item())
+    grid_size = triton.cdiv(num_tokens, BLOCK_M) + num_experts
 
     tile_idx = torch.arange(grid_size, device=device, dtype=torch.int64)
     tile_expert = torch.searchsorted(tiles_cumsum[1:], tile_idx, right=True)
@@ -137,7 +137,7 @@ def build_tile_schedule(group_sizes: torch.Tensor, num_tokens: int, BLOCK_M: int
     tile_expert = tile_expert.clamp(max=num_experts - 1)
 
     local_tile = tile_idx - tiles_cumsum[tile_expert]
-    tile_row_start = offsets[tile_expert] + local_tile * BLOCK_M
+    tile_row_start = torch.where(valid, offsets[tile_expert] + local_tile * BLOCK_M, torch.zeros_like(local_tile))
     tile_row_count = torch.clamp(offsets[tile_expert + 1] - tile_row_start, min=0, max=BLOCK_M)
     tile_row_count = torch.where(valid, tile_row_count, torch.zeros_like(tile_row_count))
 
@@ -159,15 +159,15 @@ def fused_moe_mlp(
     BLOCK_K: int = 32,
 ) -> torch.Tensor:
     
-    print(f"w13.shape: {w13.shape}, w13.stride: {w13.stride()}")
+    print(f"[FUSED_MOE_MLP] w13.shape: {w13.shape}, w13.stride: {w13.stride()}")
 
-    print(f"w2.shape: {w2.shape}, w2.stride: {w2.stride()}")
+    print(f"[FUSED_MOE_MLP] w2.shape: {w2.shape}, w2.stride: {w2.stride()}")
 
-    print(f"group_sizes.sum(): {group_sizes.sum()}")
-    print(f"x.shape[0]: {x.shape[0]}")
-    print(f"group_sizes.max(): {group_sizes.max()}")
-    print(f"group_sizes.min(): {group_sizes.min()}")
-    print(f"group_sizes.nonzero().shape: {group_sizes.nonzero().shape}")
+    print(f"[FUSED_MOE_MLP] group_sizes.sum(): {group_sizes.sum()}")
+    print(f"[FUSED_MOE_MLP] x.shape[0]: {x.shape[0]}")
+    print(f"[FUSED_MOE_MLP] group_sizes.max(): {group_sizes.max()}")
+    print(f"[FUSED_MOE_MLP] group_sizes.min(): {group_sizes.min()}")
+    print(f"[FUSED_MOE_MLP] group_sizes.nonzero().shape: {group_sizes.nonzero().shape}")
 
     num_tokens, hidden_size = x.shape
     num_experts, _, up_dim = w13.shape
@@ -181,8 +181,6 @@ def fused_moe_mlp(
 
     device = x.device
     hidden = torch.empty((num_tokens, inter_size), dtype=x.dtype, device=device)
-
-    print(hidden.stride())
 
     assert int(group_sizes.sum()) == x.shape[0]
     assert (tile_row_count_t >= 0).all()
