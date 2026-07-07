@@ -10,8 +10,9 @@ def benchmark(hidden_size, inter_size):
 
     num_experts = 128
 
-    group_sizes = torch.zeros(num_experts, dtype=torch.int32, device=device)
-    group_sizes[0] = 64
+    #group_sizes = torch.zeros(num_experts, dtype=torch.int32, device=device)
+    #group_sizes[0] = 64
+    group_sizes = torch.randint(0,64,(num_experts,))
     num_tokens = int(group_sizes.sum().cpu())
 
     x = torch.randn(
@@ -23,16 +24,16 @@ def benchmark(hidden_size, inter_size):
 
     w13 = torch.randn(
         num_experts,
-        2 * inter_size,
         hidden_size,
+        2 * inter_size,
         dtype=torch.float16,
         device=device,
     )
 
     w2 = torch.randn(
         num_experts,
-        hidden_size,
         inter_size,
+        hidden_size,
         dtype=torch.float16,
         device=device,
     )

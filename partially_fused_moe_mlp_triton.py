@@ -10,7 +10,7 @@ def _grouped_gemm1_swiglu_kernel(
     tile_expert_ptr, tile_row_start_ptr, tile_row_count_ptr,
     hidden_size, inter_size,
     stride_xm, stride_xk,
-    stride_w13_e, stride_w13_n, stride_w13_k,
+    stride_w13_e, stride_w13_k, stride_w13_n,
     stride_hm, stride_hn,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -27,7 +27,7 @@ def _grouped_gemm1_swiglu_kernel(
 
     offs_m = tl.arange(0, BLOCK_M)
     m_mask = offs_m < row_count
-    rows = row_start + offs_m
+    rows = tl.cast(row_start + offs_m, tl.int64)
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < inter_size
@@ -45,19 +45,19 @@ def _grouped_gemm1_swiglu_kernel(
         x_tile = tl.load(x_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
 
         gate_ptrs = (
-            w13_base + offs_n[:, None] * stride_w13_n + offs_k[None, :] * stride_w13_k
+            w13_base + offs_k[:, None] * stride_w13_k + offs_n[None, :] * stride_w13_n
         )
-        gate_w = tl.load(gate_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+        gate_w = tl.load(gate_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
 
         up_ptrs = (
             w13_base
-            + (offs_n[:, None] + inter_size) * stride_w13_n
-            + offs_k[None, :] * stride_w13_k
+            + offs_k[:, None] * stride_w13_k
+            + (offs_n[None, :] + inter_size) * stride_w13_n
         )
-        up_w = tl.load(up_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+        up_w = tl.load(up_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
 
-        acc_gate = tl.dot(x_tile, tl.trans(gate_w), acc_gate)
-        acc_up = tl.dot(x_tile, tl.trans(up_w), acc_up)
+        acc_gate = tl.dot(x_tile, gate_w, acc_gate)
+        acc_up = tl.dot(x_tile, up_w, acc_up)
 
     # SwiGLU
     silu_gate = acc_gate * tl.sigmoid(acc_gate)
@@ -74,7 +74,7 @@ def _grouped_gemm2_kernel(
     tile_expert_ptr, tile_row_start_ptr, tile_row_count_ptr,
     hidden_size, inter_size,
     stride_hm, stride_hk,
-    stride_w2_e, stride_w2_n, stride_w2_k,
+    stride_w2_e, stride_w2_k, stride_w2_n,
     stride_om, stride_on,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -108,11 +108,11 @@ def _grouped_gemm2_kernel(
         h_tile = tl.load(h_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
 
         w2_ptrs = (
-            w2_base + offs_n[:, None] * stride_w2_n + offs_k[None, :] * stride_w2_k
+            w2_base + offs_k[:, None] * stride_w2_k + offs_n[None, :] * stride_w2_n
         )
-        w2_tile = tl.load(w2_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+        w2_tile = tl.load(w2_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
 
-        acc = tl.dot(h_tile.to(w2_tile.dtype), tl.trans(w2_tile), acc)
+        acc = tl.dot(h_tile.to(w2_tile.dtype), w2_tile, acc)
 
     out_ptrs = out_ptr + rows[:, None] * stride_om + offs_n[None, :] * stride_on
     tl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=m_mask[:, None] & n_mask[None, :])
@@ -151,8 +151,8 @@ def build_tile_schedule(group_sizes: torch.Tensor, num_tokens: int, BLOCK_M: int
 
 def fused_moe_mlp(
     x: torch.Tensor,            # (num_tokens, hidden_size)
-    w13: torch.Tensor,          # (num_experts, 2*inter_size, hidden_size)
-    w2: torch.Tensor,           # (num_experts, hidden_size, inter_size)
+    w13: torch.Tensor,          # (num_experts, hidden_size, 2*inter_size)
+    w2: torch.Tensor,           # (num_experts, inter_size, hidden_size)
     group_sizes: torch.Tensor,  # (num_experts,) int
     BLOCK_M: int = 32,
     BLOCK_N: int = 32,
@@ -170,7 +170,7 @@ def fused_moe_mlp(
     print(f"group_sizes.nonzero().shape: {group_sizes.nonzero().shape}")
 
     num_tokens, hidden_size = x.shape
-    num_experts, up_dim, _ = w13.shape
+    num_experts, _, up_dim = w13.shape
     inter_size = up_dim // 2
 
 
@@ -225,18 +225,18 @@ def fused_moe_mlp(
 # НИЖЕ ВАЙБКОД ДЛЯ ТЕСТА
 # ----------------------------------------------------------------------
 def reference_moe_mlp(x, w13, w2, group_sizes):
-    inter_size = w13.shape[1] // 2
-    out = torch.empty(x.shape[0], w2.shape[1], dtype=x.dtype, device=x.device)
+    inter_size = w13.shape[2] // 2
+    out = torch.empty(x.shape[0], w2.shape[2], dtype=x.dtype, device=x.device)
     row = 0
     for e in range(w13.shape[0]):
         n = int(group_sizes[e].item())
         if n == 0:
             continue
         xe = x[row:row + n]
-        gate_up = xe.float() @ w13[e].float().T
+        gate_up = xe.float() @ w13[e].float()
         gate, up = gate_up[:, :inter_size], gate_up[:, inter_size:]
         hidden = torch.nn.functional.silu(gate) * up
-        out[row:row + n] = (hidden @ w2[e].float().T).to(x.dtype)
+        out[row:row + n] = (hidden @ w2[e].float()).to(x.dtype)
         row += n
     return out
 
@@ -251,8 +251,8 @@ if __name__ == "__main__":
 
     device = "cuda"
     x = torch.randn(num_tokens, hidden_size, dtype=torch.float16, device=device) * 0.1
-    w13 = torch.randn(num_experts, 2 * inter_size, hidden_size, dtype=torch.float16, device=device) * 0.05
-    w2 = torch.randn(num_experts, hidden_size, inter_size, dtype=torch.float16, device=device) * 0.05
+    w13 = torch.randn(num_experts, hidden_size, 2 * inter_size, dtype=torch.float16, device=device) * 0.05
+    w2 = torch.randn(num_experts, inter_size, hidden_size, dtype=torch.float16, device=device) * 0.05
 
     out_triton = fused_moe_mlp(x, w13, w2, group_sizes)
     out_ref = reference_moe_mlp(x, w13, w2, group_sizes)
