@@ -180,3 +180,91 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+hidden = torch.ops.npu.npu_grouped_matmul(
+    x=[x],
+    weight=[w13],
+    bias=None,
+    split_item=2,
+    group_list_type=1,
+    group_type=0,
+    group_list=group_sizes,
+    output_dtype=x.dtype,
+)[0]
+
+hidden = torch.ops.npu.npu_swiglu(hidden)
+
+ref = torch.ops.npu.npu_grouped_matmul(
+    x=[hidden],
+    weight=[w2],
+    bias=None,
+    split_item=2,
+    group_list_type=1,
+    group_type=0,
+    group_list=group_sizes,
+    output_dtype=x.dtype,
+)[0]
+
+out = grouped_gemm2(
+    hidden,
+    w2,
+    group_sizes,
+)
+
+torch.testing.assert_close(ref, out, atol=1e-2, rtol=1e-2)
+
+def grouped_gemm2(
+    hidden: torch.Tensor,       # (num_tokens, inter_size)
+    w2: torch.Tensor,           # (num_experts, inter_size, hidden_size)
+    group_sizes: torch.Tensor,
+    BLOCK_M: int = 32,
+    BLOCK_N: int = 32,
+    BLOCK_K: int = 32,
+) -> torch.Tensor:
+
+    num_tokens, inter_size = hidden.shape
+    num_experts, _, hidden_size = w2.shape
+
+    group_sizes = group_sizes.to(device=hidden.device)
+
+    (
+        tile_expert_t,
+        tile_row_start_t,
+        tile_row_count_t,
+        grid_m,
+    ) = build_tile_schedule(
+        group_sizes,
+        num_tokens,
+        BLOCK_M,
+    )
+
+    out = torch.empty(
+        (num_tokens, hidden_size),
+        dtype=hidden.dtype,
+        device=hidden.device,
+    )
+
+    grid = (grid_m, triton.cdiv(hidden_size, BLOCK_N))
+
+    _grouped_gemm2_kernel[grid](
+        hidden,
+        w2,
+        out,
+        tile_expert_t,
+        tile_row_start_t,
+        tile_row_count_t,
+        hidden_size,
+        inter_size,
+        hidden.stride(0),
+        hidden.stride(1),
+        w2.stride(0),
+        w2.stride(1),
+        w2.stride(2),
+        out.stride(0),
+        out.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+
+    return out
