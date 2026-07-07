@@ -129,7 +129,7 @@ def build_tile_schedule(group_sizes: torch.Tensor, num_tokens: int, BLOCK_M: int
     tiles_cumsum = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
     tiles_cumsum[1:] = torch.cumsum(tiles_per_expert, dim=0)
 
-    grid_size = triton.cdiv(num_tokens, BLOCK_M) + num_experts
+    grid_size = triton.cdiv(num_tokens, BLOCK_M) + num_experts # upper bound
 
     tile_idx = torch.arange(grid_size, device=device, dtype=torch.int64)
     tile_expert = torch.searchsorted(tiles_cumsum[1:], tile_idx, right=True)
@@ -164,7 +164,7 @@ def fused_moe_mlp(
     print(f"[FUSED_MOE_MLP] w2.shape: {w2.shape}, w2.stride: {w2.stride()}")
 
     print(f"[FUSED_MOE_MLP] group_sizes.sum(): {group_sizes.sum()}")
-    print(f"[FUSED_MOE_MLP] x.shape[0]: {x.shape[0]}")
+    print(f"[FUSED_MOE_MLP] x.shape: {x.shape}")
     print(f"[FUSED_MOE_MLP] group_sizes.max(): {group_sizes.max()}")
     print(f"[FUSED_MOE_MLP] group_sizes.min(): {group_sizes.min()}")
     print(f"[FUSED_MOE_MLP] group_sizes.nonzero().shape: {group_sizes.nonzero().shape}")
