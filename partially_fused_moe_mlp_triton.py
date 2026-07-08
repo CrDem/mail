@@ -67,6 +67,29 @@ def _grouped_gemm1_swiglu_kernel(
     tl.store(hidden_ptrs, hidden_tile, mask=m_mask[:, None] & n_mask[None, :])
 
 
+@triton.jit
+def swiglu_kernel(
+    gate_ptr,
+    up_ptr,
+    out_ptr,
+    n_elements: tl.constexpr
+):
+    token_id = tl.program_id(0)
+
+    row_offset = token_id * n_elements
+
+    offs = tl.arange(0, n_elements)
+
+    acc_gate = tl.load(gate_ptr + row_offset + offs)
+    acc_up = tl.load(up_ptr + row_offset + offs)
+
+    # SwiGLU
+    silu_gate = acc_gate * tl.sigmoid(acc_gate)
+    hidden_tile = (silu_gate * acc_up).to(out_ptr.dtype.element_ty)
+
+    tl.store(out_ptr + offs, hidden_tile)
+
+
 # gmm2
 @triton.jit
 def _grouped_gemm2_kernel(
@@ -215,6 +238,63 @@ def fused_moe_mlp(
         w2.stride(0), w2.stride(1), w2.stride(2),
         out.stride(0), out.stride(1),
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+
+    return out
+
+
+def grouped_gemm2(
+    hidden: torch.Tensor,       # (num_tokens, inter_size)
+    w2: torch.Tensor,           # (num_experts, inter_size, hidden_size)
+    group_sizes: torch.Tensor,
+    BLOCK_M: int = 32,
+    BLOCK_N: int = 32,
+    BLOCK_K: int = 32,
+) -> torch.Tensor:
+
+    num_tokens, inter_size = hidden.shape
+    num_experts, _, hidden_size = w2.shape
+
+    group_sizes = group_sizes.to(device=hidden.device)
+
+    (
+        tile_expert_t,
+        tile_row_start_t,
+        tile_row_count_t,
+        grid_m,
+    ) = build_tile_schedule(
+        group_sizes,
+        num_tokens,
+        BLOCK_M,
+    )
+
+    out = torch.empty(
+        (num_tokens, hidden_size),
+        dtype=hidden.dtype,
+        device=hidden.device,
+    )
+
+    grid = (grid_m, triton.cdiv(hidden_size, BLOCK_N))
+
+    _grouped_gemm2_kernel[grid](
+        hidden,
+        w2,
+        out,
+        tile_expert_t,
+        tile_row_start_t,
+        tile_row_count_t,
+        hidden_size,
+        inter_size,
+        hidden.stride(0),
+        hidden.stride(1),
+        w2.stride(0),
+        w2.stride(1),
+        w2.stride(2),
+        out.stride(0),
+        out.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
     )
 
     return out

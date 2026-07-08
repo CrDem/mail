@@ -3,7 +3,7 @@ import traceback
 
 import torch
 
-from fused_moe_mlp import fused_moe_mlp
+from partially_fused_moe_mlp_triton import fused_moe_mlp, grouped_gemm2, swiglu_kernel
 
 
 def reference_moe_mlp(x, w13, w2, expert_tokens):
@@ -60,28 +60,28 @@ def benchmark(hidden_size, inter_size):
 
     num_tokens = int(group_sizes.sum().cpu())
 
-    x = torch.randn(
+    x = torch.empty(
         num_tokens,
         hidden_size,
-        dtype=torch.float16,
+        dtype=torch.bfloat16,
         device=device,
-    )
+    ).normal_(mean=0.0, std=0.5)
 
-    w13 = torch.randn(
+    w13 = torch.empty(
         num_experts,
         hidden_size,
         2 * inter_size,
-        dtype=torch.float16,
+        dtype=torch.bfloat16,
         device=device,
-    )
+    ).normal_(mean=0.0, std=0.5)
 
-    w2 = torch.randn(
+    w2 = torch.empty(
         num_experts,
         inter_size,
         hidden_size,
-        dtype=torch.float16,
+        dtype=torch.bfloat16,
         device=device,
-    )
+    ).normal_(mean=0.0, std=0.5)
 
     #
     # correctness
@@ -157,6 +157,49 @@ def benchmark(hidden_size, inter_size):
         f"{(end - start) * 1000:.3f} ms"
     )
 
+def test_swiglu(inter_size):
+
+    device = torch.device("npu")
+    num_tokens = 2048
+
+    gate = torch.empty(
+        num_tokens,
+        inter_size,
+        dtype=torch.bfloat16,
+        device=device,
+    ).normal_(mean=0.0, std=0.5)
+
+    up = torch.empty(
+        num_tokens,
+        inter_size,
+        dtype=torch.bfloat16,
+        device=device,
+    ).normal_(mean=0.0, std=0.5)
+
+    out = torch.empty(
+        num_tokens,
+        inter_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    swiglu_kernel(
+        gate,
+        up,
+        out,
+        inter_size
+    )
+
+    ref = torch.ops.npu.npu_swiglu(torch.cat((gate, up), dim=-1))
+
+    torch.testing.assert_close(
+        out,
+        ref,
+        rtol=0.0,
+        atol=1e-2,
+    )
+
+    print("Correctness OK")
 
 def main():
     cases = [
@@ -180,91 +223,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-hidden = torch.ops.npu.npu_grouped_matmul(
-    x=[x],
-    weight=[w13],
-    bias=None,
-    split_item=2,
-    group_list_type=1,
-    group_type=0,
-    group_list=group_sizes,
-    output_dtype=x.dtype,
-)[0]
-
-hidden = torch.ops.npu.npu_swiglu(hidden)
-
-ref = torch.ops.npu.npu_grouped_matmul(
-    x=[hidden],
-    weight=[w2],
-    bias=None,
-    split_item=2,
-    group_list_type=1,
-    group_type=0,
-    group_list=group_sizes,
-    output_dtype=x.dtype,
-)[0]
-
-out = grouped_gemm2(
-    hidden,
-    w2,
-    group_sizes,
-)
-
-torch.testing.assert_close(ref, out, atol=1e-2, rtol=1e-2)
-
-def grouped_gemm2(
-    hidden: torch.Tensor,       # (num_tokens, inter_size)
-    w2: torch.Tensor,           # (num_experts, inter_size, hidden_size)
-    group_sizes: torch.Tensor,
-    BLOCK_M: int = 32,
-    BLOCK_N: int = 32,
-    BLOCK_K: int = 32,
-) -> torch.Tensor:
-
-    num_tokens, inter_size = hidden.shape
-    num_experts, _, hidden_size = w2.shape
-
-    group_sizes = group_sizes.to(device=hidden.device)
-
-    (
-        tile_expert_t,
-        tile_row_start_t,
-        tile_row_count_t,
-        grid_m,
-    ) = build_tile_schedule(
-        group_sizes,
-        num_tokens,
-        BLOCK_M,
-    )
-
-    out = torch.empty(
-        (num_tokens, hidden_size),
-        dtype=hidden.dtype,
-        device=hidden.device,
-    )
-
-    grid = (grid_m, triton.cdiv(hidden_size, BLOCK_N))
-
-    _grouped_gemm2_kernel[grid](
-        hidden,
-        w2,
-        out,
-        tile_expert_t,
-        tile_row_start_t,
-        tile_row_count_t,
-        hidden_size,
-        inter_size,
-        hidden.stride(0),
-        hidden.stride(1),
-        w2.stride(0),
-        w2.stride(1),
-        w2.stride(2),
-        out.stride(0),
-        out.stride(1),
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-    )
-
-    return out
