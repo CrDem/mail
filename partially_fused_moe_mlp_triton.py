@@ -68,7 +68,7 @@ def _grouped_gemm1_swiglu_kernel(
 
 
 @triton.jit
-def swiglu_kernel(
+def _swiglu_kernel(
     gate_ptr,
     up_ptr,
     out_ptr,
@@ -88,6 +88,94 @@ def swiglu_kernel(
     hidden_tile = (silu_gate * acc_up).to(out_ptr.dtype.element_ty)
 
     tl.store(out_ptr + offs, hidden_tile)
+
+@triton.jit
+def _swiglu_kernel_simulate(
+    x_ptr,          # [num_tokens, 2 * inter_size]
+    out_ptr,        # [num_tokens, inter_size]
+
+    inter_size,
+
+    stride_xm,
+    stride_xn,
+
+    stride_om,
+    stride_on,
+
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask = (
+        (offs_m[:, None] < num_tokens)
+        & (offs_n[None, :] < inter_size)
+    )
+
+    gate_ptrs = (
+        x_ptr
+        + offs_m[:, None] * stride_xm
+        + offs_n[None, :] * stride_xn
+    )
+
+    up_ptrs = (
+        x_ptr
+        + offs_m[:, None] * stride_xm
+        + (offs_n[None, :] + inter_size) * stride_xn
+    )
+
+    acc_gate = tl.load(gate_ptrs, mask=mask, other=0)
+    acc_up = tl.load(up_ptrs, mask=mask, other=0)
+
+    silu_gate = acc_gate * tl.sigmoid(acc_gate)
+    hidden_tile = (silu_gate * acc_up).to(out_ptr.dtype.element_ty)
+
+    out_ptrs = (
+        out_ptr
+        + offs_m[:, None] * stride_om
+        + offs_n[None, :] * stride_on
+    )
+
+    tl.store(out_ptrs, hidden_tile, mask=mask)
+
+
+def swiglu_triton(
+    x: torch.Tensor,
+    out: torch.Tensor, 
+    num_tokens: int,
+    inter_size: int,
+) -> torch.Tensor:
+    num_tokens = x.shape[0]
+    BLOCK_M = 32
+    BLOCK_N = 32
+    grid = (
+        triton.cdiv(num_tokens, BLOCK_M),
+        triton.cdiv(inter_size, BLOCK_N),
+    )
+
+    _swiglu_kernel_simulate[grid](
+        x,
+        out,
+
+        inter_size,
+
+        x.stride(0),
+        x.stride(1),
+
+        out.stride(0),
+        out.stride(1),
+
+        BLOCK_M=32,
+        BLOCK_N=32,
+    )
+
+    #grid = (inter_size,)
+    #_swiglu_kernel[grid](gate, up, out, inter_size)
+    return out
 
 
 # gmm2

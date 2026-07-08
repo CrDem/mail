@@ -3,7 +3,7 @@ import traceback
 
 import torch
 
-from partially_fused_moe_mlp_triton import fused_moe_mlp, grouped_gemm2, swiglu_kernel
+from partially_fused_moe_mlp_triton import fused_moe_mlp, grouped_gemm2, swiglu_triton
 
 
 def reference_moe_mlp(x, w13, w2, expert_tokens):
@@ -183,10 +183,10 @@ def test_swiglu(inter_size):
         device=device,
     )
 
-    swiglu_kernel(
-        gate,
-        up,
+    swiglu_triton(
+        torch.cat((gate, up), dim=-1),
         out,
+        num_tokens,
         inter_size
     )
 
