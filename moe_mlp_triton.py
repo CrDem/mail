@@ -146,7 +146,7 @@ def _swiglu_kernel_simulate(
 
     tl.store(out_ptrs, hidden_tile, mask=mask)
 
-def moe_mlp_triton(
+def fused_moe_mlp(
     x: torch.Tensor,            # (num_tokens, hidden_size)
     w13: torch.Tensor,          # (num_experts, hidden_size, 2*inter_size)
     w2: torch.Tensor,           # (num_experts, inter_size, hidden_size)
@@ -201,8 +201,12 @@ def moe_mlp_triton(
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
     )
 
+    grid_swiglu = (
+        triton.cdiv(num_tokens, BLOCK_M),
+        triton.cdiv(inter_size, BLOCK_N),
+    )
     hidden_swiglu = torch.empty((num_tokens, inter_size*2), dtype=x.dtype, device=device)
-    _swiglu_kernel_simulate(hidden, hidden_swiglu,
+    _swiglu_kernel_simulate[grid_swiglu](hidden, hidden_swiglu,
                             inter_size,
                             hidden.stride(0), hidden.stride(1),
                             hidden_swiglu.stride(0), hidden_swiglu.stride(1),
