@@ -98,6 +98,7 @@ def _swiglu_kernel_simulate(
     x_ptr,          # [num_tokens, 2 * inter_size]
     out_ptr,        # [num_tokens, inter_size]
 
+    num_tokens,
     inter_size,
 
     stride_xm,
@@ -207,7 +208,7 @@ def fused_moe_mlp(
     )
     hidden_swiglu = torch.empty((num_tokens, inter_size*2), dtype=x.dtype, device=device)
     _swiglu_kernel_simulate[grid_swiglu](hidden, hidden_swiglu,
-                            inter_size,
+                            num_tokens, inter_size,
                             hidden.stride(0), hidden.stride(1),
                             hidden_swiglu.stride(0), hidden_swiglu.stride(1),
                             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N)
