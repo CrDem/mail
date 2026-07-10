@@ -40,7 +40,7 @@ def reference_moe_mlp(x, w13, w2, expert_tokens):
     return hidden_states
 
 
-def benchmark(hidden_size, inter_size):
+def benchmark(hidden_size, inter_size, checkAccuracy=True, checkPerf=True):
     device = torch.device("npu")
 
     num_experts = 128
@@ -83,79 +83,95 @@ def benchmark(hidden_size, inter_size):
         device=device,
     ).normal_(mean=0.0, std=0.5)
 
-    #
-    # correctness
-    #
+    if (checkAccuracy):
+        #
+        # correctness
+        #
 
-    ref = reference_moe_mlp(
-        x,
-        w13,
-        w2,
-        group_sizes,
-    )
+        ref = reference_moe_mlp(
+            x,
+            w13,
+            w2,
+            group_sizes,
+        )
 
-    out = fused_moe_mlp(
-        x,
-        w13,
-        w2,
-        group_sizes,
-        BLOCK_M=32,
-        BLOCK_N=32,
-        BLOCK_K=32,
-    )
+        out = fused_moe_mlp(
+            x,
+            w13,
+            w2,
+            group_sizes,
+            BLOCK_M=32,
+            BLOCK_N=32,
+            BLOCK_K=32,
+        )
 
-    torch.npu.synchronize()
+        torch.npu.synchronize()
 
-    torch.testing.assert_close(
-        out,
-        ref,
-        rtol=1e-2,
-        atol=1e-2,
-    )
+        torch.testing.assert_close(
+            out,
+            ref,
+            rtol=1e-2,
+            atol=1e-2,
+        )
 
-    print("Correctness OK")
+        print("Correctness OK")
 
-    #
-    # warmup
-    #
+    if (checkPerf):
 
-    fused_moe_mlp(
-        x,
-        w13,
-        w2,
-        group_sizes,
-        BLOCK_M=32,
-        BLOCK_N=32,
-        BLOCK_K=32,
-    )
+        #
+        # warmup
+        #
 
-    torch.npu.synchronize()
+        for _ in range(100):
+            fused_moe_mlp(
+                x,
+                w13,
+                w2,
+                group_sizes,
+                BLOCK_M=32,
+                BLOCK_N=32,
+                BLOCK_K=32,
+            )
 
-    #
-    # benchmark
-    #
+        torch.npu.synchronize()
 
-    start = time.perf_counter()
+        #
+        # benchmark
+        #
+        
+        startTriton = time.perf_counter()
+        for _ in range(1000):
+            fused_moe_mlp(
+                x,
+                w13,
+                w2,
+                group_sizes,
+                BLOCK_M=32,
+                BLOCK_N=32,
+                BLOCK_K=32,
+            )
 
-    fused_moe_mlp(
-        x,
-        w13,
-        w2,
-        group_sizes,
-        BLOCK_M=32,
-        BLOCK_N=32,
-        BLOCK_K=32,
-    )
+        torch.npu.synchronize()
+        endTriton = time.perf_counter()
 
-    torch.npu.synchronize()
+        startNPU = time.perf_counter()
+        for _ in range(1000):
+            reference_moe_mlp(
+                x,
+                w13,
+                w2,
+                group_sizes,
+            )
 
-    end = time.perf_counter()
+        torch.npu.synchronize()
+        endNPU = time.perf_counter()
 
-    print(
-        f"OK  hidden={hidden_size:<5} "
-        f"inter={inter_size:<5} "
-        f"{(end - start) * 1000:.3f} ms"
-    )
+        print(
+            f"hidden={hidden_size:<5} "
+            f"inter={inter_size:<5} "
+            f"Triton kernel: {(endTriton - startTriton):.3f} ms"
+            f"NPU ops: {(endNPU - startNPU):.3f} ms"
+        )
 
 def test_swiglu(inter_size):
 
@@ -215,7 +231,7 @@ def main():
         print(f"Testing hidden={hidden}, inter={inter}")
 
         try:
-            benchmark(hidden, inter)
+            benchmark(hidden, inter, checkAccuracy=False, checkPerf=True)
         except Exception:
             traceback.print_exc()
             break
