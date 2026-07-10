@@ -6,103 +6,80 @@ import triton.language as tl
 @triton.jit
 def _fused_moe_mlp_kernel(
     x_ptr, w13_ptr, w2_ptr, out_ptr,
-    # per-tile schedule
     tile_expert_ptr, tile_row_start_ptr, tile_row_count_ptr,
-    # sizes
     hidden_size, inter_size,
-    # strides
     stride_xm, stride_xk,
     stride_w13_e, stride_w13_k, stride_w13_n,
     stride_w2_e, stride_w2_k, stride_w2_n,
     stride_om, stride_on,
-
-    BLOCK_M: tl.constexpr,      # rows per program
-    BLOCK_N: tl.constexpr,      # intermediate-dim tile
-    BLOCK_K: tl.constexpr,      # hidden-dim tile (K for gemm1, and now also
-                                # the output-dim tile for gemm2)
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_N2: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
-    pid = tl.program_id(0)
+    pid_m = tl.program_id(0)
+    pid_n2 = tl.program_id(1)
 
-    expert_id = tl.load(tile_expert_ptr + pid)
-    row_start = tl.load(tile_row_start_ptr + pid)
-    row_count = tl.load(tile_row_count_ptr + pid)
-
-    if row_count == 0: # extra tiles
+    expert_id = tl.load(tile_expert_ptr + pid_m)
+    row_start = tl.load(tile_row_start_ptr + pid_m)
+    row_count = tl.load(tile_row_count_ptr + pid_m)
+    if row_count == 0:
         return
 
     offs_m = tl.arange(0, BLOCK_M)
     m_mask = offs_m < row_count
-    rows = row_start + offs_m
+    rows = tl.cast(row_start + offs_m, tl.int64)
+
+    offs_n2 = pid_n2 * BLOCK_N2 + tl.arange(0, BLOCK_N2)
+    n2_mask = offs_n2 < hidden_size
 
     w13_base = w13_ptr + expert_id * stride_w13_e
     w2_base = w2_ptr + expert_id * stride_w2_e
 
-    for h0 in range(0, hidden_size, BLOCK_K):
-        offs_h = h0 + tl.arange(0, BLOCK_K)
-        h_mask = offs_h < hidden_size
+    acc_out = tl.zeros((BLOCK_M, BLOCK_N2), dtype=tl.float32)
 
-        acc_out = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+    for n0 in range(0, inter_size, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        n_mask = offs_n < inter_size
 
-        # intermediate-dim tiling, tile size = BLOCK_N
-        for n0 in range(0, inter_size, BLOCK_N):
-            offs_n = n0 + tl.arange(0, BLOCK_N)
-            n_mask = offs_n < inter_size
+        acc_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        acc_up = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-            acc_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-            acc_up = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k0 in range(0, hidden_size, BLOCK_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < hidden_size
 
-            # hidden_size-dim tiling, tile size = BLOCK_K (reduction for gemm1)
-            for k0 in range(0, hidden_size, BLOCK_K):
-                offs_k = k0 + tl.arange(0, BLOCK_K)
-                k_mask = offs_k < hidden_size
+            x_ptrs = x_ptr + rows[:, None] * stride_xm + offs_k[None, :] * stride_xk
+            x_tile = tl.load(x_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
 
-                x_ptrs = x_ptr + rows[:, None] * stride_xm + offs_k[None, :] * stride_xk
-                x_tile = tl.load(
-                    x_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0
-                )
-
-                gate_ptrs = (
-                    w13_base
-                    + offs_k[:, None] * stride_w13_k
-                    + offs_n[None, :] * stride_w13_n
-                )
-                gate_w = tl.load(
-                    gate_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0
-                )
-
-                up_ptrs = (
-                    w13_base
-                    + offs_k[:, None] * stride_w13_k
-                    + (offs_n[None, :] + inter_size) * stride_w13_n
-                )
-                up_w = tl.load(
-                    up_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0
-                )
-
-                acc_gate = tl.dot(x_tile, gate_w, acc_gate)
-                acc_up = tl.dot(x_tile, up_w, acc_up)
-
-            # SwiGLU
-            silu_gate = acc_gate * tl.sigmoid(acc_gate)
-            hidden_chunk = (silu_gate * acc_up)  # (BLOCK_M, BLOCK_N)
-
-            # gmm2 (BLOCK_K, BLOCK_N)
-            w2_ptrs = (
-                w2_base
-                + offs_n[:, None] * stride_w2_k
-                + offs_h[None, :] * stride_w2_n
+            gate_ptrs = (
+                w13_base + offs_k[:, None] * stride_w13_k + offs_n[None, :] * stride_w13_n
             )
-            w2_tile = tl.load(
-                w2_ptrs, mask=h_mask[:, None] & n_mask[None, :], other=0.0
-            )  # (BLOCK_K, BLOCK_N)
+            gate_w = tl.load(gate_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
 
-            acc_out = tl.dot(hidden_chunk.to(w2_tile.dtype), w2_tile, acc_out)
+            up_ptrs = (
+                w13_base
+                + offs_k[:, None] * stride_w13_k
+                + (offs_n[None, :] + inter_size) * stride_w13_n
+            )
+            up_w = tl.load(up_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
 
-        out_ptrs = out_ptr + rows[:, None] * stride_om + offs_h[None, :] * stride_on
-        tl.store(
-            out_ptrs, acc_out.to(out_ptr.dtype.element_ty),
-            mask=m_mask[:, None] & h_mask[None, :],
+            acc_gate = tl.dot(x_tile, gate_w, acc_gate)
+            acc_up = tl.dot(x_tile, up_w, acc_up)
+
+        # SwiGLU
+        silu_gate = acc_gate * tl.sigmoid(acc_gate)
+        hidden_tile = (silu_gate * acc_up).to(w2_ptr.dtype.element_ty)
+
+        w2_ptrs = (
+            w2_base + offs_n[:, None] * stride_w2_k + offs_n2[None, :] * stride_w2_n
         )
+        w2_tile = tl.load(w2_ptrs, mask=n_mask[:, None] & n2_mask[None, :], other=0.0)
+
+        acc_out = tl.dot(hidden_tile, w2_tile, acc_out)
+
+    out_ptrs = out_ptr + rows[:, None] * stride_om + offs_n2[None, :] * stride_on
+    tl.store(out_ptrs, acc_out.to(out_ptr.dtype.element_ty), mask=m_mask[:, None] & n2_mask[None, :])
 
 
 def build_tile_schedule(group_sizes: torch.Tensor, num_tokens: int, BLOCK_M: int):
@@ -137,38 +114,35 @@ def build_tile_schedule(group_sizes: torch.Tensor, num_tokens: int, BLOCK_M: int
 
 
 def fused_moe_mlp(
-    x: torch.Tensor,            # (num_tokens, hidden_size),
-    w13: torch.Tensor,          # (num_experts, 2*inter_size, hidden_size),
-    w2: torch.Tensor,           # (num_experts, hidden_size, inter_size),
+    x: torch.Tensor,            # (num_tokens, hidden_size)
+    w13: torch.Tensor,          # (num_experts, hidden_size, 2*inter_size)
+    w2: torch.Tensor,           # (num_experts, inter_size, hidden_size)
     group_sizes: torch.Tensor,  # (num_experts,) int
     BLOCK_M: int = 32,
     BLOCK_N: int = 32,
+    BLOCK_N2: int = 32,
     BLOCK_K: int = 32,
 ) -> torch.Tensor:
-    
-    print(f"w13.shape: {w13.shape}, w13.stride: {w13.stride()}")
+
+    '''print(f"w13.shape: {w13.shape}, w13.stride: {w13.stride()}")
     print(f"w2.shape: {w2.shape}, w2.stride: {w2.stride()}")
 
     print(f"group_sizes.sum(): {group_sizes.sum()}")
     print(f"x.shape[0]: {x.shape[0]}")
     print(f"group_sizes.max(): {group_sizes.max()}")
     print(f"group_sizes.min(): {group_sizes.min()}")
-    print(f"group_sizes.nonzero().shape: {group_sizes.nonzero().shape}")
+    print(f"group_sizes.nonzero().shape: {group_sizes.nonzero().shape}")'''
 
     num_tokens, hidden_size = x.shape
-    num_experts, up_dim, _ = w13.shape
+    num_experts, _, up_dim = w13.shape
     inter_size = up_dim // 2
 
     group_sizes = group_sizes.to(device=x.device)
-
-    tile_expert_t, tile_row_start_t, tile_row_count_t, grid_size = build_tile_schedule(
+    tile_expert_t, tile_row_start_t, tile_row_count_t, grid_m = build_tile_schedule(
         group_sizes, num_tokens, BLOCK_M
     )
 
-    device = x.device
-    out = torch.empty((num_tokens, hidden_size), dtype=x.dtype, device=device)
-
-    assert int(group_sizes.sum()) == x.shape[0]
+    '''assert int(group_sizes.sum()) == x.shape[0]
 
     assert (tile_row_count_t >= 0).all()
     assert (tile_row_count_t <= BLOCK_M).all()
@@ -178,9 +152,12 @@ def fused_moe_mlp(
     assert (
         tile_row_start_t + tile_row_count_t
         <= num_tokens
-    ).all()
+    ).all()'''
 
-    grid = (grid_size,)
+    device = x.device
+    out = torch.empty((num_tokens, hidden_size), dtype=x.dtype, device=device)
+
+    grid = (grid_m, triton.cdiv(hidden_size, BLOCK_N2))
     _fused_moe_mlp_kernel[grid](
         x, w13, w2, out,
         tile_expert_t, tile_row_start_t, tile_row_count_t,
@@ -189,8 +166,9 @@ def fused_moe_mlp(
         w13.stride(0), w13.stride(1), w13.stride(2),
         w2.stride(0), w2.stride(1), w2.stride(2),
         out.stride(0), out.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_N2=BLOCK_N2, BLOCK_K=BLOCK_K,
     )
+
     return out
 
 
