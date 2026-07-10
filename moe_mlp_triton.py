@@ -147,6 +147,56 @@ def _swiglu_kernel_simulate(
 
     tl.store(out_ptrs, hidden_tile, mask=mask)
 
+# gmm2
+@triton.jit
+def _grouped_gemm2_kernel(
+    hidden_ptr, w2_ptr, out_ptr,
+    tile_expert_ptr, tile_row_start_ptr, tile_row_count_ptr,
+    hidden_size, inter_size,
+    stride_hm, stride_hk,
+    stride_w2_e, stride_w2_k, stride_w2_n,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    expert_id = tl.load(tile_expert_ptr + pid_m)
+    row_start = tl.load(tile_row_start_ptr + pid_m)
+    row_count = tl.load(tile_row_count_ptr + pid_m)
+    if row_count == 0:
+        return
+
+    offs_m = tl.arange(0, BLOCK_M)
+    m_mask = offs_m < row_count
+    rows = row_start + offs_m
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < hidden_size
+
+    w2_base = w2_ptr + expert_id * stride_w2_e
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k0 in range(0, inter_size, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < inter_size
+
+        h_ptrs = hidden_ptr + rows[:, None] * stride_hm + offs_k[None, :] * stride_hk
+        h_tile = tl.load(h_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+
+        w2_ptrs = (
+            w2_base + offs_k[:, None] * stride_w2_k + offs_n[None, :] * stride_w2_n
+        )
+        w2_tile = tl.load(w2_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+
+        acc = tl.dot(h_tile.to(w2_tile.dtype), w2_tile, acc)
+
+    out_ptrs = out_ptr + rows[:, None] * stride_om + offs_n[None, :] * stride_on
+    tl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=m_mask[:, None] & n_mask[None, :])
+
 def fused_moe_mlp(
     x: torch.Tensor,            # (num_tokens, hidden_size)
     w13: torch.Tensor,          # (num_experts, hidden_size, 2*inter_size)
@@ -206,23 +256,21 @@ def fused_moe_mlp(
         triton.cdiv(num_tokens, BLOCK_M),
         triton.cdiv(inter_size, BLOCK_N),
     )
-    hidden_swiglu = torch.empty((num_tokens, inter_size*2), dtype=x.dtype, device=device)
+    hidden_swiglu = torch.empty((num_tokens, inter_size), dtype=x.dtype, device=device)
     _swiglu_kernel_simulate[grid_swiglu](hidden, hidden_swiglu,
                             num_tokens, inter_size,
                             hidden.stride(0), hidden.stride(1),
                             hidden_swiglu.stride(0), hidden_swiglu.stride(1),
                             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N)
-    
-    return hidden_swiglu
 
     out = torch.empty((num_tokens, hidden_size), dtype=x.dtype, device=device)
 
     grid2 = (grid_m, triton.cdiv(hidden_size, BLOCK_N))
     _grouped_gemm2_kernel[grid2](
-        hidden, w2, out,
+        hidden_swiglu, w2, out,
         tile_expert_t, tile_row_start_t, tile_row_count_t,
         hidden_size, inter_size,
-        hidden.stride(0), hidden.stride(1),
+        hidden_swiglu.stride(0), hidden_swiglu.stride(1),
         w2.stride(0), w2.stride(1), w2.stride(2),
         out.stride(0), out.stride(1),
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
