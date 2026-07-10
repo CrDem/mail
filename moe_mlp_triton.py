@@ -93,6 +93,59 @@ def _grouped_gemm1(
     hidden_ptrs_up = hidden_ptr + rows[:, None] * stride_hm + (offs_n[None, :] + inter_size) * stride_hn
     tl.store(hidden_ptrs_up, acc_up.to(hidden_ptr.dtype.element_ty), mask=m_mask[:, None] & n_mask[None, :])
 
+@triton.jit
+def _swiglu_kernel_simulate(
+    x_ptr,          # [num_tokens, 2 * inter_size]
+    out_ptr,        # [num_tokens, inter_size]
+
+    inter_size,
+
+    stride_xm,
+    stride_xn,
+
+    stride_om,
+    stride_on,
+
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask = (
+        (offs_m[:, None] < num_tokens)
+        & (offs_n[None, :] < inter_size)
+    )
+
+    gate_ptrs = (
+        x_ptr
+        + offs_m[:, None] * stride_xm
+        + offs_n[None, :] * stride_xn
+    )
+
+    up_ptrs = (
+        x_ptr
+        + offs_m[:, None] * stride_xm
+        + (offs_n[None, :] + inter_size) * stride_xn
+    )
+
+    acc_gate = tl.load(gate_ptrs, mask=mask, other=0)
+    acc_up = tl.load(up_ptrs, mask=mask, other=0)
+
+    silu_gate = acc_gate * tl.sigmoid(acc_gate)
+    hidden_tile = (silu_gate * acc_up).to(out_ptr.dtype.element_ty)
+
+    out_ptrs = (
+        out_ptr
+        + offs_m[:, None] * stride_om
+        + offs_n[None, :] * stride_on
+    )
+
+    tl.store(out_ptrs, hidden_tile, mask=mask)
+
 def moe_mlp_triton(
     x: torch.Tensor,            # (num_tokens, hidden_size)
     w13: torch.Tensor,          # (num_experts, hidden_size, 2*inter_size)
@@ -147,7 +200,15 @@ def moe_mlp_triton(
         hidden.stride(0), hidden.stride(1),
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
     )
-    return hidden
+
+    hidden_swiglu = torch.empty((num_tokens, inter_size*2), dtype=x.dtype, device=device)
+    _swiglu_kernel_simulate(hidden, hidden_swiglu,
+                            inter_size,
+                            hidden.stride(0), hidden.stride(1),
+                            hidden_swiglu.stride(0), hidden_swiglu.stride(1),
+                            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N)
+    
+    return hidden_swiglu
 
     out = torch.empty((num_tokens, hidden_size), dtype=x.dtype, device=device)
 
