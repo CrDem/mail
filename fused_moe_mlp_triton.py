@@ -2,7 +2,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 @triton.jit
 def _fused_moe_mlp_kernel(
     x_ptr, w13_ptr, w2_ptr, out_ptr,
@@ -16,9 +15,9 @@ def _fused_moe_mlp_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_N2: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    NUM_N2_TILES: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
-    pid_n2 = tl.program_id(1)
 
     expert_id = tl.load(tile_expert_ptr + pid_m)
     row_start = tl.load(tile_row_start_ptr + pid_m)
@@ -30,13 +29,8 @@ def _fused_moe_mlp_kernel(
     m_mask = offs_m < row_count
     rows = tl.cast(row_start + offs_m, tl.int64)
 
-    offs_n2 = pid_n2 * BLOCK_N2 + tl.arange(0, BLOCK_N2)
-    n2_mask = offs_n2 < hidden_size
-
     w13_base = w13_ptr + expert_id * stride_w13_e
     w2_base = w2_ptr + expert_id * stride_w2_e
-
-    acc_out = tl.zeros((BLOCK_M, BLOCK_N2), dtype=tl.float32)
 
     for n0 in range(0, inter_size, BLOCK_N):
         offs_n = n0 + tl.arange(0, BLOCK_N)
@@ -71,15 +65,26 @@ def _fused_moe_mlp_kernel(
         silu_gate = acc_gate * tl.sigmoid(acc_gate)
         hidden_tile = (silu_gate * acc_up).to(w2_ptr.dtype.element_ty)
 
-        w2_ptrs = (
-            w2_base + offs_n[:, None] * stride_w2_k + offs_n2[None, :] * stride_w2_n
-        )
-        w2_tile = tl.load(w2_ptrs, mask=n_mask[:, None] & n2_mask[None, :], other=0.0)
+        # gmm2
+        for i in tl.static_range(NUM_N2_TILES):
+            offs_n2 = i * BLOCK_N2 + tl.arange(0, BLOCK_N2)
+            n2_mask = offs_n2 < hidden_size
 
-        acc_out = tl.dot(hidden_tile, w2_tile, acc_out)
+            w2_ptrs = (
+                w2_base + offs_n[:, None] * stride_w2_k + offs_n2[None, :] * stride_w2_n
+            )
+            w2_tile = tl.load(w2_ptrs, mask=n_mask[:, None] & n2_mask[None, :], other=0.0)
 
-    out_ptrs = out_ptr + rows[:, None] * stride_om + offs_n2[None, :] * stride_on
-    tl.store(out_ptrs, acc_out.to(out_ptr.dtype.element_ty), mask=m_mask[:, None] & n2_mask[None, :])
+            partial_out = tl.dot(hidden_tile, w2_tile)
+
+            out_ptrs = out_ptr + rows[:, None] * stride_om + offs_n2[None, :] * stride_on
+            out_mask = m_mask[:, None] & n2_mask[None, :]
+
+            if n0 == 0:
+                tl.store(out_ptrs, partial_out.to(out_ptr.dtype.element_ty), mask=out_mask)
+            else:
+                prev = tl.load(out_ptrs, mask=out_mask, other=0.0).to(tl.float32)
+                tl.store(out_ptrs, (prev + partial_out).to(out_ptr.dtype.element_ty), mask=out_mask)
 
 
 def build_tile_schedule(group_sizes: torch.Tensor, num_tokens: int, BLOCK_M: int):
@@ -112,7 +117,6 @@ def build_tile_schedule(group_sizes: torch.Tensor, num_tokens: int, BLOCK_M: int
         grid_size,
     )
 
-
 def fused_moe_mlp(
     x: torch.Tensor,            # (num_tokens, hidden_size)
     w13: torch.Tensor,          # (num_experts, hidden_size, 2*inter_size)
@@ -124,15 +128,6 @@ def fused_moe_mlp(
     BLOCK_K: int = 32,
 ) -> torch.Tensor:
 
-    '''print(f"w13.shape: {w13.shape}, w13.stride: {w13.stride()}")
-    print(f"w2.shape: {w2.shape}, w2.stride: {w2.stride()}")
-
-    print(f"group_sizes.sum(): {group_sizes.sum()}")
-    print(f"x.shape[0]: {x.shape[0]}")
-    print(f"group_sizes.max(): {group_sizes.max()}")
-    print(f"group_sizes.min(): {group_sizes.min()}")
-    print(f"group_sizes.nonzero().shape: {group_sizes.nonzero().shape}")'''
-
     num_tokens, hidden_size = x.shape
     num_experts, _, up_dim = w13.shape
     inter_size = up_dim // 2
@@ -142,22 +137,12 @@ def fused_moe_mlp(
         group_sizes, num_tokens, BLOCK_M
     )
 
-    '''assert int(group_sizes.sum()) == x.shape[0]
-
-    assert (tile_row_count_t >= 0).all()
-    assert (tile_row_count_t <= BLOCK_M).all()
-
-    assert (tile_row_start_t >= 0).all()
-
-    assert (
-        tile_row_start_t + tile_row_count_t
-        <= num_tokens
-    ).all()'''
-
     device = x.device
     out = torch.empty((num_tokens, hidden_size), dtype=x.dtype, device=device)
 
-    grid = (grid_m, triton.cdiv(hidden_size, BLOCK_N2))
+    num_n2_tiles = triton.cdiv(hidden_size, BLOCK_N2)
+
+    grid = (grid_m,)
     _fused_moe_mlp_kernel[grid](
         x, w13, w2, out,
         tile_expert_t, tile_row_start_t, tile_row_count_t,
@@ -167,10 +152,10 @@ def fused_moe_mlp(
         w2.stride(0), w2.stride(1), w2.stride(2),
         out.stride(0), out.stride(1),
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_N2=BLOCK_N2, BLOCK_K=BLOCK_K,
+        NUM_N2_TILES=num_n2_tiles,
     )
 
     return out
-
 
 # НИЖЕ ВАЙБКОД ДЛЯ ТЕСТА
 # ----------------------------------------------------------------------
