@@ -303,3 +303,17 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+''' save tensors:
+import os
+import torch
+
+save_dir = "moe_debug"
+os.makedirs(save_dir, exist_ok=True)
+
+torch.save(hidden_states.cpu(), os.path.join(save_dir, "hidden_states.pt"))
+torch.save(expert_tokens.cpu(), os.path.join(save_dir, "expert_tokens.pt"))
+
+print(f"Saved hidden_states: {hidden_states.shape}, {hidden_states.dtype}")
+print(f"Saved expert_tokens: {expert_tokens.shape}, {expert_tokens.dtype}")
+'''
