@@ -111,32 +111,38 @@ def benchmark(hidden_size, inter_size, checkAccuracy=True, checkPerf=True):
 
 
     w13_list = []
+    w2_list = []
     with safe_open(
-        "/home/akuznetsov/t1/model-00001-of-00016.safetensors",
+        "/home/akuznetsov/t1/sglang/model-00001-of-00016.safetensors",
         framework="pt",
         device="cpu",
     ) as f:
         for expert_id in range(num_experts):
-            gate = f.get_tensor(
-                f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"
-            )
-            up = f.get_tensor(
-                f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight"
-            )
-
+            gate = f.get_tensor( f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight" )
+            up = f.get_tensor( f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight" )
             gate_up = torch.cat([gate, up], dim=0)
-
             w13_list.append(gate_up)
+
+            w2_part = f.get_tensor( f"model.layers.0.mlp.experts.{expert_id}.down_proj.weight" )
+            w2_list.append(w2_part)
+
 
     w13 = torch.stack(w13_list, dim=0)
     w13 = w13.to('npu')
     w13 = torch.transpose(w13, 1, 2)
 
+    w2 = w2.to('npu')
+    w2 = torch.transpose(w2, 1, 2)
+
     print(f"type(w13): {type(w13)}")
     print(f"w13.dtype: {w13.dtype}")
     print(f"w13.shape: {w13.shape}")
 
-    w13 = torch.empty(
+    print(f"type(w2): {type(w2)}")
+    print(f"w2.dtype: {w2.dtype}")
+    print(f"w2.shape: {w2.shape}")
+
+    '''w13 = torch.empty(
         num_experts,
         hidden_size,
         2 * inter_size,
@@ -150,7 +156,7 @@ def benchmark(hidden_size, inter_size, checkAccuracy=True, checkPerf=True):
         hidden_size,
         dtype=torch.bfloat16,
         device=device,
-    ).normal_(mean=0.0, std=0.5)
+    ).normal_(mean=0.0, std=0.5)'''
 
     if (checkAccuracy):
         #
