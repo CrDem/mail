@@ -66,6 +66,7 @@ def _fused_moe_mlp_kernel(
         hidden_tile = (silu_gate * acc_up).to(w2_ptr.dtype.element_ty)
 
         # gmm2
+        partial_out = tl.zeros((BLOCK_M, BLOCK_N2), dtype=tl.float32)
         for i in tl.static_range(NUM_N2_TILES):
             offs_n2 = i * BLOCK_N2 + tl.arange(0, BLOCK_N2)
             n2_mask = offs_n2 < hidden_size
@@ -156,4 +157,4 @@ def fused_moe_mlp(
         NUM_N2_TILES=num_n2_tiles,
     )
 
-    return out
+    return out.to(x.dtype)
