@@ -18,6 +18,90 @@ def _fused_moe_mlp_kernel(
     NUM_N2_TILES: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
+
+    expert_id = tl.load(tile_expert_ptr + pid_m)
+    row_start = tl.load(tile_row_start_ptr + pid_m)
+    row_count = tl.load(tile_row_count_ptr + pid_m)
+    if row_count == 0:
+        return
+
+    offs_m = tl.arange(0, BLOCK_M)
+    m_mask = offs_m < row_count
+    rows = tl.cast(row_start + offs_m, tl.int64)
+
+    w13_base = w13_ptr + expert_id * stride_w13_e
+    w2_base = w2_ptr + expert_id * stride_w2_e
+
+    for n0 in range(0, inter_size, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        n_mask = offs_n < inter_size
+
+        acc_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        acc_up = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for k0 in range(0, hidden_size, BLOCK_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < hidden_size
+
+            x_ptrs = x_ptr + rows[:, None] * stride_xm + offs_k[None, :] * stride_xk
+            x_tile = tl.load(x_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+
+            gate_ptrs = (
+                w13_base + offs_k[:, None] * stride_w13_k + offs_n[None, :] * stride_w13_n
+            )
+            gate_w = tl.load(gate_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+
+            up_ptrs = (
+                w13_base
+                + offs_k[:, None] * stride_w13_k
+                + (offs_n[None, :] + inter_size) * stride_w13_n
+            )
+            up_w = tl.load(up_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+
+            acc_gate = tl.dot(x_tile, gate_w, acc_gate)
+            acc_up = tl.dot(x_tile, up_w, acc_up)
+
+        # SwiGLU
+        silu_gate = acc_gate * tl.sigmoid(acc_gate)
+        hidden_tile = (silu_gate * acc_up).to(w2_ptr.dtype.element_ty)
+
+        # gmm2
+        for i in tl.static_range(NUM_N2_TILES):
+            offs_n2 = i * BLOCK_N2 + tl.arange(0, BLOCK_N2)
+            n2_mask = offs_n2 < hidden_size
+
+            w2_ptrs = (
+                w2_base + offs_n[:, None] * stride_w2_k + offs_n2[None, :] * stride_w2_n
+            )
+            w2_tile = tl.load(w2_ptrs, mask=n_mask[:, None] & n2_mask[None, :], other=0.0)
+
+            partial_out = tl.dot(hidden_tile, w2_tile)
+
+            out_ptrs = out_ptr + rows[:, None] * stride_om + offs_n2[None, :] * stride_on
+            out_mask = m_mask[:, None] & n2_mask[None, :]
+
+            if n0 == 0:
+                tl.store(out_ptrs, partial_out.to(out_ptr.dtype.element_ty), mask=out_mask)
+            else:
+                prev = tl.load(out_ptrs, mask=out_mask, other=0.0).to(tl.float32)
+                tl.store(out_ptrs, (prev + partial_out).to(out_ptr.dtype.element_ty), mask=out_mask)
+
+@triton.jit
+def _fused_moe_mlp_kernel(
+    x_ptr, w13_ptr, w2_ptr, out_ptr,
+    tile_expert_ptr, tile_row_start_ptr, tile_row_count_ptr,
+    hidden_size, inter_size,
+    stride_xm, stride_xk,
+    stride_w13_e, stride_w13_k, stride_w13_n,
+    stride_w2_e, stride_w2_k, stride_w2_n,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_N2: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_N2_TILES: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
     expert_id = tl.load(tile_expert_ptr + pid_m)
@@ -133,11 +217,11 @@ def fused_moe_mlp(
     )
 
     device = x.device
-    out = torch.zeros((num_tokens, hidden_size), dtype=x.dtype, device=device)
+    out = torch.empty((num_tokens, hidden_size), dtype=x.dtype, device=device)
 
     num_n2_tiles = triton.cdiv(hidden_size, BLOCK_N2)
 
-    grid = (grid_m, triton.cdiv(inter_size, BLOCK_N))
+    grid = (grid_m,)
     _fused_moe_mlp_kernel[grid](
         x, w13, w2, out,
         tile_expert_t, tile_row_start_t, tile_row_count_t,
