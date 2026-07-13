@@ -67,8 +67,8 @@ def _fused_moe_mlp_kernel(
 
         # gmm2
         partial_out = tl.zeros((BLOCK_M, BLOCK_N2), dtype=tl.float32)
-        for i in tl.static_range(NUM_N2_TILES):
-            offs_n2 = i * BLOCK_N2 + tl.arange(0, BLOCK_N2)
+        for i in range(0, hidden_size, BLOCK_N2):
+            offs_n2 = i + tl.arange(0, BLOCK_N2)
             n2_mask = offs_n2 < hidden_size
 
             w2_ptrs = (
