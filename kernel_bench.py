@@ -109,23 +109,28 @@ def benchmark(hidden_size, inter_size, checkAccuracy=True, checkPerf=True):
         device=device,
     ).normal_(mean=0.0, std=0.5)
 
+
+    w13_list = []
     with safe_open(
-        "/home/k60128028/t1/model-00001-of-00016.safetensors",
+        "/home/akuznetsov/t1/model-00001-of-00016.safetensors",
         framework="pt",
         device="cpu",
     ) as f:
-        w13_gate = f.get_tensor("model.layers.0.mlp.experts.0.gate_proj.weight")
-        w13_up = f.get_tensor("model.layers.0.mlp.experts.0.up_proj.weight")
+        for expert_id in range(num_experts):
+            gate = f.get_tensor(
+                f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"
+            )
+            up = f.get_tensor(
+                f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight"
+            )
 
-    print(f"type(w13_gate): {type(w13_gate)}")
-    print(f"w13_gate.dtype: {w13_gate.dtype}")
-    print(f"w13_gate.shape: {w13_gate.shape}")
+            gate_up = torch.cat([gate, up], dim=0)
 
-    print(f"type(w13_up): {type(w13_up)}")
-    print(f"w13_up.dtype: {w13_up.dtype}")
-    print(f"w13_up.shape: {w13_up.shape}")
+            w13_list.append(gate_up)
 
-    w13 = torch.concat((w13_gate, w13_up), dim=-1)
+    w13 = torch.stack(w13_list, dim=0)
+    w13 = w13.to('npu')
+    w13 = torch.transpose(w13, 1, 2)
 
     print(f"type(w13): {type(w13)}")
     print(f"w13.dtype: {w13.dtype}")
