@@ -7,11 +7,6 @@ from partially_fused_moe_mlp_triton import fused_moe_mlp, grouped_gemm2, swiglu_
 
 
 def reference_moe_mlp(x, w13, w2, expert_tokens):
-    """
-    Полная копия текущей реализации из SGLang:
-        grouped_matmul -> npu_swiglu -> grouped_matmul
-    Без каких-либо изменений.
-    """
 
     hidden_states = torch.ops.npu.npu_grouped_matmul(
         x=[x],
@@ -55,6 +50,51 @@ def benchmark(hidden_size, inter_size, checkAccuracy=True, checkPerf=True):
         28, 15, 7, 23, 15, 6, 70, 23, 23, 6, 1, 22, 11, 12, 38, 12,
         8, 14, 11, 15, 18, 14, 12, 4, 3, 11, 2, 37, 14, 21, 41, 18,
     ]
+    group_sizes = torch.tensor([
+        # пустые эксперты
+        0, 0,
+
+        # совсем маленькие
+        1, 2, 3, 4, 5, 7, 8,
+
+        # около половины блока
+        31, 32, 33,
+        63, 64, 65,
+
+        # вокруг BLOCK_M
+        127, 128, 129,
+
+        # чуть больше
+        130, 131, 150,
+
+        # несколько тайлов
+        255, 256, 257,
+
+        # три тайла
+        383, 384, 385,
+
+        # четыре тайла
+        511, 512, 513,
+
+        # большие
+        777,
+        1000,
+
+        # опять пустые
+        0, 0,
+
+        # случайные маленькие
+        17, 9, 41, 6, 11,
+
+        # снова около BLOCK_M
+        126, 127, 128, 129, 130,
+
+        # огромные
+        1023, 1024, 1025,
+
+        # хвост
+        13, 27, 2, 19, 0, 8
+    ], dtype=torch.int64, device=device)
 
     group_sizes = torch.tensor(group_sizes, dtype=torch.int64, device=device)
 
