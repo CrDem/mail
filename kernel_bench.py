@@ -36,13 +36,112 @@ def reference_moe_mlp(x, w13, w2, expert_tokens):
 
     return hidden_states
 
+def autotune_fused_moe(
+    x,
+    w13,
+    w2,
+    group_sizes,
+    warmup=20,
+    iters=100,
+):
+
+    configs = [
+        (16, 64, 64, 64),
+        (32, 64, 64, 64),
+        (32, 64, 128, 64),
+        (32, 128, 64, 64),
+        (32, 64, 128, 128),
+        (64, 64, 64, 64),
+        (64, 128, 128, 64),
+    ]
+
+    best_cfg = None
+    best_time = float("inf")
+
+    print("\nAutotuning...\n")
+
+    for BLOCK_M, BLOCK_N, BLOCK_N2, BLOCK_K in configs:
+
+        try:
+
+            #
+            # warmup
+            #
+
+            for _ in range(warmup):
+                fused_moe_mlp(
+                    x,
+                    w13,
+                    w2,
+                    group_sizes,
+                    BLOCK_M=BLOCK_M,
+                    BLOCK_N=BLOCK_N,
+                    BLOCK_N2=BLOCK_N2,
+                    BLOCK_K=BLOCK_K,
+                )
+
+            torch.npu.synchronize()
+
+            #
+            # benchmark
+            #
+
+            t0 = time.perf_counter()
+
+            for _ in range(iters):
+                fused_moe_mlp(
+                    x,
+                    w13,
+                    w2,
+                    group_sizes,
+                    BLOCK_M=BLOCK_M,
+                    BLOCK_N=BLOCK_N,
+                    BLOCK_N2=BLOCK_N2,
+                    BLOCK_K=BLOCK_K,
+                )
+
+            torch.npu.synchronize()
+            t1 = time.perf_counter()
+
+            elapsed = (t1 - t0) / iters
+
+            print(
+                f"M={BLOCK_M:3d} "
+                f"N={BLOCK_N:3d} "
+                f"N2={BLOCK_N2:3d} "
+                f"K={BLOCK_K:3d} "
+                f"{elapsed*1e6:9.1f} us"
+            )
+
+            if elapsed < best_time:
+                best_time = elapsed
+                best_cfg = (
+                    BLOCK_M,
+                    BLOCK_N,
+                    BLOCK_N2,
+                    BLOCK_K,
+                )
+
+        except Exception as e:
+            print(
+                f"M={BLOCK_M} "
+                f"N={BLOCK_N} "
+                f"N2={BLOCK_N2} "
+                f"K={BLOCK_K} "
+                f"FAILED ({e})"
+            )
+
+    print("\nBest config:", best_cfg)
+    print(f"Average: {best_time*1e6:.1f} us\n")
+
+    return best_cfg
 
 def benchmark(hidden_size, inter_size, checkAccuracy=True, checkPerf=True):
     device = torch.device("npu")
 
     num_experts = 128
 
-    group_sizes = [
+    '''group_sizes = [
         13, 14, 20, 13, 10, 6, 20, 14, 29, 5, 3, 2, 2, 11, 10, 16,
         60, 18, 9, 12, 14, 16, 15, 15, 11, 13, 20, 13, 22, 6, 6, 21,
         10, 29, 13, 23, 22, 11, 9, 26, 2, 13, 4, 27, 9, 25, 5, 6,
@@ -98,16 +197,16 @@ def benchmark(hidden_size, inter_size, checkAccuracy=True, checkPerf=True):
         13, 27, 2, 19, 0, 8
     ], dtype=torch.int64, device=device)
 
-    group_sizes = torch.tensor(group_sizes, dtype=torch.int64, device=device)
+    group_sizes = torch.tensor(group_sizes, dtype=torch.int64, device=device)'''
 
     num_tokens = int(group_sizes.sum().cpu())
 
-    x = torch.empty(
+    '''x = torch.empty(
         num_tokens,
         hidden_size,
         dtype=torch.bfloat16,
         device=device,
-    ).normal_(mean=0.0, std=0.5)
+    ).normal_(mean=0.0, std=0.5)'''
 
 
     w13_list = []
@@ -131,6 +230,7 @@ def benchmark(hidden_size, inter_size, checkAccuracy=True, checkPerf=True):
     w13 = w13.to('npu')
     w13 = torch.transpose(w13, 1, 2)
 
+    w2 = torch.stack(w2_list, dim=0)
     w2 = w2.to('npu')
     w2 = torch.transpose(w2, 1, 2)
 
@@ -193,41 +293,11 @@ def benchmark(hidden_size, inter_size, checkAccuracy=True, checkPerf=True):
 
     if (checkPerf):
 
-        #
-        # warmup
-        #
-
-        for _ in range(100):
-            fused_moe_mlp(
-                x,
-                w13,
-                w2,
-                group_sizes,
-                BLOCK_M=32,
-                BLOCK_N=32,
-                BLOCK_K=32,
-            )
-
-        torch.npu.synchronize()
+        autotune_fused_moe()
 
         #
-        # benchmark
+        # benchmark npu
         #
-        
-        startTriton = time.perf_counter()
-        for _ in range(1000):
-            fused_moe_mlp(
-                x,
-                w13,
-                w2,
-                group_sizes,
-                BLOCK_M=32,
-                BLOCK_N=32,
-                BLOCK_K=32,
-            )
-
-        torch.npu.synchronize()
-        endTriton = time.perf_counter()
 
         startNPU = time.perf_counter()
         for _ in range(1000):
@@ -244,7 +314,6 @@ def benchmark(hidden_size, inter_size, checkAccuracy=True, checkPerf=True):
         print(
             f"hidden={hidden_size:<5} "
             f"inter={inter_size:<5} "
-            f"Triton kernel: {(endTriton - startTriton):.3f} ms"
             f"NPU ops: {(endNPU - startNPU):.3f} ms"
         )
 
