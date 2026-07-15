@@ -3,11 +3,64 @@ import triton
 import triton.language as tl
 
 
+@triton.jit
+def _locate_tile(pid_m, group_sizes_ptr, num_experts, BLOCK_M: tl.constexpr):
+    """
+    Given a global M-tile index `pid_m`, figure out on the fly:
+      - which expert this tile belongs to (expert_id)
+      - the starting row offset for this tile (row_start)
+      - how many valid rows it actually has, <= BLOCK_M (row_count)
+
+    This replaces the host-side build_tile_schedule() pass (cumsum +
+    searchsorted + several elementwise torch kernels, each with its own
+    launch overhead). Every program instead walks the small group_sizes
+    array once on-device. Same approach as the official Triton
+    grouped-gemm tutorial (persistent "which group am I in" loop).
+
+    Kept entirely in int32 inside the loop (group_sizes is forced to
+    int32 by the caller) so loop-carried variables have a consistent
+    dtype across iterations; only cast to int64 once at the very end,
+    right before it's used for pointer/stride arithmetic.
+    """
+    running_tiles = 0
+    running_rows = 0
+
+    expert_id = 0
+    row_start = 0
+    row_count = 0
+    assigned = 0
+
+    for e in range(0, num_experts):
+        gs = tl.load(group_sizes_ptr + e)
+        tiles_e = (gs + BLOCK_M - 1) // BLOCK_M
+
+        local_tile = pid_m - running_tiles
+        hit = (local_tile >= 0) & (local_tile < tiles_e) & (assigned == 0)
+
+        cand_row_start = running_rows + local_tile * BLOCK_M
+        cand_row_count = gs - local_tile * BLOCK_M
+        cand_row_count = tl.minimum(cand_row_count, BLOCK_M)
+        cand_row_count = tl.maximum(cand_row_count, 0)
+
+        expert_id = tl.where(hit, e, expert_id)
+        row_start = tl.where(hit, cand_row_start, row_start)
+        row_count = tl.where(hit, cand_row_count, row_count)
+        assigned = tl.where(hit, 1, assigned)
+
+        running_tiles += tiles_e
+        running_rows += gs
+
+    # tiles beyond the real schedule (pid_m >= total actual tiles, since the
+    # grid is only an upper bound) simply never hit -> row_count stays 0,
+    # caller does an early return, exactly like before.
+    return expert_id.to(tl.int64), row_start.to(tl.int64), row_count.to(tl.int64)
+
+
 # fused gmm1 (gate_up_proj) + SwiGLU
 @triton.jit
 def _grouped_gemm1_swiglu_kernel(
     x_ptr, w13_ptr, hidden_ptr,
-    tile_expert_ptr, tile_row_start_ptr, tile_row_count_ptr,
+    group_sizes_ptr, num_experts,
     hidden_size, inter_size,
     stride_xm, stride_xk,
     stride_w13_e, stride_w13_k, stride_w13_n,
@@ -19,9 +72,7 @@ def _grouped_gemm1_swiglu_kernel(
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    expert_id = tl.load(tile_expert_ptr + pid_m)
-    row_start = tl.load(tile_row_start_ptr + pid_m)
-    row_count = tl.load(tile_row_count_ptr + pid_m)
+    expert_id, row_start, row_count = _locate_tile(pid_m, group_sizes_ptr, num_experts, BLOCK_M)
     if row_count == 0:
         return
 
@@ -70,123 +121,11 @@ def _grouped_gemm1_swiglu_kernel(
     hidden_ptrs = hidden_ptr + rows[:, None] * stride_hm + offs_n[None, :] * stride_hn
     tl.store(hidden_ptrs, hidden_tile, mask=m_mask[:, None] & n_mask[None, :])
 
-
-@triton.jit
-def _swiglu_kernel(
-    gate_ptr,
-    up_ptr,
-    out_ptr,
-    n_elements: tl.constexpr
-):
-    token_id = tl.program_id(0)
-
-    row_offset = token_id * n_elements
-
-    offs = tl.arange(0, n_elements)
-
-    acc_gate = tl.load(gate_ptr + row_offset + offs)
-    acc_up = tl.load(up_ptr + row_offset + offs)
-
-    # SwiGLU
-    silu_gate = acc_gate * tl.sigmoid(acc_gate)
-    hidden_tile = (silu_gate * acc_up).to(out_ptr.dtype.element_ty)
-
-    tl.store(out_ptr + offs, hidden_tile)
-
-@triton.jit
-def _swiglu_kernel_simulate(
-    x_ptr,          # [num_tokens, 2 * inter_size]
-    out_ptr,        # [num_tokens, inter_size]
-
-    inter_size,
-
-    stride_xm,
-    stride_xn,
-
-    stride_om,
-    stride_on,
-
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-    mask = (
-        (offs_m[:, None] < num_tokens)
-        & (offs_n[None, :] < inter_size)
-    )
-
-    gate_ptrs = (
-        x_ptr
-        + offs_m[:, None] * stride_xm
-        + offs_n[None, :] * stride_xn
-    )
-
-    up_ptrs = (
-        x_ptr
-        + offs_m[:, None] * stride_xm
-        + (offs_n[None, :] + inter_size) * stride_xn
-    )
-
-    acc_gate = tl.load(gate_ptrs, mask=mask, other=0)
-    acc_up = tl.load(up_ptrs, mask=mask, other=0)
-
-    silu_gate = acc_gate * tl.sigmoid(acc_gate)
-    hidden_tile = (silu_gate * acc_up).to(out_ptr.dtype.element_ty)
-
-    out_ptrs = (
-        out_ptr
-        + offs_m[:, None] * stride_om
-        + offs_n[None, :] * stride_on
-    )
-
-    tl.store(out_ptrs, hidden_tile, mask=mask)
-
-
-def swiglu_triton(
-    x: torch.Tensor,
-    out: torch.Tensor, 
-    num_tokens: int,
-    inter_size: int,
-) -> torch.Tensor:
-    num_tokens = x.shape[0]
-    BLOCK_M = 32
-    BLOCK_N = 32
-    grid = (
-        triton.cdiv(num_tokens, BLOCK_M),
-        triton.cdiv(inter_size, BLOCK_N),
-    )
-
-    _swiglu_kernel_simulate[grid](
-        x,
-        out,
-
-        inter_size,
-
-        x.stride(0),
-        x.stride(1),
-
-        out.stride(0),
-        out.stride(1),
-
-        BLOCK_M=32,
-        BLOCK_N=32,
-    )
-
-    #grid = (inter_size,)
-    #_swiglu_kernel[grid](gate, up, out, inter_size)
-    return out
-
-
 # gmm2
 @triton.jit
 def _grouped_gemm2_kernel(
     hidden_ptr, w2_ptr, out_ptr,
-    tile_expert_ptr, tile_row_start_ptr, tile_row_count_ptr,
+    group_sizes_ptr, num_experts,
     hidden_size, inter_size,
     stride_hm, stride_hk,
     stride_w2_e, stride_w2_k, stride_w2_n,
@@ -198,9 +137,7 @@ def _grouped_gemm2_kernel(
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    expert_id = tl.load(tile_expert_ptr + pid_m)
-    row_start = tl.load(tile_row_start_ptr + pid_m)
-    row_count = tl.load(tile_row_count_ptr + pid_m)
+    expert_id, row_start, row_count = _locate_tile(pid_m, group_sizes_ptr, num_experts, BLOCK_M)
     if row_count == 0:
         return
 
@@ -233,37 +170,6 @@ def _grouped_gemm2_kernel(
     tl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=m_mask[:, None] & n_mask[None, :])
 
 
-def build_tile_schedule(group_sizes: torch.Tensor, num_tokens: int, BLOCK_M: int):
-    device = group_sizes.device
-    num_experts = group_sizes.numel()
-
-    offsets = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
-    offsets[1:] = torch.cumsum(group_sizes.to(torch.int64), dim=0)
-
-    tiles_per_expert = (group_sizes.to(torch.int64) + BLOCK_M - 1) // BLOCK_M
-    tiles_cumsum = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
-    tiles_cumsum[1:] = torch.cumsum(tiles_per_expert, dim=0)
-
-    grid_size = triton.cdiv(num_tokens, BLOCK_M) + num_experts # upper bound
-
-    tile_idx = torch.arange(grid_size, device=device, dtype=torch.int64)
-    tile_expert = torch.searchsorted(tiles_cumsum[1:], tile_idx, right=True)
-    valid = tile_expert < num_experts
-    tile_expert = tile_expert.clamp(max=num_experts - 1)
-
-    local_tile = tile_idx - tiles_cumsum[tile_expert]
-    tile_row_start = torch.where(valid, offsets[tile_expert] + local_tile * BLOCK_M, torch.zeros_like(local_tile))
-    tile_row_count = torch.clamp(offsets[tile_expert + 1] - tile_row_start, min=0, max=BLOCK_M)
-    tile_row_count = torch.where(valid, tile_row_count, torch.zeros_like(tile_row_count))
-
-    return (
-        tile_expert.to(torch.int64),
-        tile_row_start.to(torch.int64),
-        tile_row_count.to(torch.int64),
-        grid_size,
-    )
-
-
 def fused_moe_mlp(
     x: torch.Tensor,            # (num_tokens, hidden_size)
     w13: torch.Tensor,          # (num_experts, hidden_size, 2*inter_size)
@@ -273,45 +179,30 @@ def fused_moe_mlp(
     BLOCK_N: int = 32,
     BLOCK_K: int = 32,
 ) -> torch.Tensor:
-    
-    '''print(f"[FUSED_MOE_MLP] w13.shape: {w13.shape}, w13.stride: {w13.stride()}")
-
-    print(f"[FUSED_MOE_MLP] w2.shape: {w2.shape}, w2.stride: {w2.stride()}")
-
-    print(f"[FUSED_MOE_MLP] group_sizes.sum(): {group_sizes.sum()}")
-    print(f"[FUSED_MOE_MLP] x.shape: {x.shape}")
-    print(f"[FUSED_MOE_MLP] group_sizes.max(): {group_sizes.max()}")
-    print(f"[FUSED_MOE_MLP] group_sizes.min(): {group_sizes.min()}")
-    print(f"[FUSED_MOE_MLP] group_sizes.nonzero().shape: {group_sizes.nonzero().shape}")'''
 
     num_tokens, hidden_size = x.shape
     num_experts, _, up_dim = w13.shape
     inter_size = up_dim // 2
 
+    # Forced to int32 + contiguous: keeps the in-kernel scheduling loop
+    # type-consistent (no int32/int64 mix across loop iterations) and
+    # guarantees stride-1 pointer arithmetic for group_sizes_ptr + e.
+    # This is a tiny (num_experts-element) op, negligible next to the
+    # eliminated cumsum/searchsorted round trips.
+    group_sizes = group_sizes.to(device=x.device, dtype=torch.int32).contiguous()
 
-    group_sizes = group_sizes.to(device=x.device)
-    tile_expert_t, tile_row_start_t, tile_row_count_t, grid_m = build_tile_schedule(
-        group_sizes, num_tokens, BLOCK_M
-    )
+    # Upper bound on the number of M-tiles. Pure function of
+    # (num_tokens, num_experts, BLOCK_M), all known on the host already -
+    # no GPU sync needed, unlike the old build_tile_schedule().
+    grid_m = triton.cdiv(num_tokens, BLOCK_M) + num_experts
 
     device = x.device
     hidden = torch.empty((num_tokens, inter_size), dtype=x.dtype, device=device)
 
-    '''assert int(group_sizes.sum()) == x.shape[0]
-    assert (tile_row_count_t >= 0).all()
-    assert (tile_row_count_t <= BLOCK_M).all()
-
-    assert (tile_row_start_t >= 0).all()
-
-    assert (
-        tile_row_start_t + tile_row_count_t
-        <= num_tokens
-    ).all()'''
-
     grid1 = (grid_m, triton.cdiv(inter_size, BLOCK_N))
     _grouped_gemm1_swiglu_kernel[grid1](
         x, w13, hidden,
-        tile_expert_t, tile_row_start_t, tile_row_count_t,
+        group_sizes, num_experts,
         hidden_size, inter_size,
         x.stride(0), x.stride(1),
         w13.stride(0), w13.stride(1), w13.stride(2),
@@ -324,7 +215,7 @@ def fused_moe_mlp(
     grid2 = (grid_m, triton.cdiv(hidden_size, BLOCK_N))
     _grouped_gemm2_kernel[grid2](
         hidden, w2, out,
-        tile_expert_t, tile_row_start_t, tile_row_count_t,
+        group_sizes, num_experts,
         hidden_size, inter_size,
         hidden.stride(0), hidden.stride(1),
         w2.stride(0), w2.stride(1), w2.stride(2),
@@ -333,102 +224,3 @@ def fused_moe_mlp(
     )
 
     return out
-
-
-def grouped_gemm2(
-    hidden: torch.Tensor,       # (num_tokens, inter_size)
-    w2: torch.Tensor,           # (num_experts, inter_size, hidden_size)
-    group_sizes: torch.Tensor,
-    BLOCK_M: int = 32,
-    BLOCK_N: int = 32,
-    BLOCK_K: int = 32,
-) -> torch.Tensor:
-
-    num_tokens, inter_size = hidden.shape
-    num_experts, _, hidden_size = w2.shape
-
-    group_sizes = group_sizes.to(device=hidden.device)
-
-    (
-        tile_expert_t,
-        tile_row_start_t,
-        tile_row_count_t,
-        grid_m,
-    ) = build_tile_schedule(
-        group_sizes,
-        num_tokens,
-        BLOCK_M,
-    )
-
-    out = torch.empty(
-        (num_tokens, hidden_size),
-        dtype=hidden.dtype,
-        device=hidden.device,
-    )
-
-    grid = (grid_m, triton.cdiv(hidden_size, BLOCK_N))
-
-    _grouped_gemm2_kernel[grid](
-        hidden,
-        w2,
-        out,
-        tile_expert_t,
-        tile_row_start_t,
-        tile_row_count_t,
-        hidden_size,
-        inter_size,
-        hidden.stride(0),
-        hidden.stride(1),
-        w2.stride(0),
-        w2.stride(1),
-        w2.stride(2),
-        out.stride(0),
-        out.stride(1),
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-    )
-
-    return out
-
-
-# НИЖЕ ВАЙБКОД ДЛЯ ТЕСТА
-# ----------------------------------------------------------------------
-def reference_moe_mlp(x, w13, w2, group_sizes):
-    inter_size = w13.shape[2] // 2
-    out = torch.empty(x.shape[0], w2.shape[2], dtype=x.dtype, device=x.device)
-    row = 0
-    for e in range(w13.shape[0]):
-        n = int(group_sizes[e].item())
-        if n == 0:
-            continue
-        xe = x[row:row + n]
-        gate_up = xe.float() @ w13[e].float()
-        gate, up = gate_up[:, :inter_size], gate_up[:, inter_size:]
-        hidden = torch.nn.functional.silu(gate) * up
-        out[row:row + n] = (hidden @ w2[e].float()).to(x.dtype)
-        row += n
-    return out
-
-
-if __name__ == "__main__":
-    torch.manual_seed(0)
-    num_experts = 4
-    hidden_size = 256
-    inter_size = 512
-    group_sizes = torch.tensor([37, 12, 50, 21])
-    num_tokens = int(group_sizes.sum())
-
-    device = "cuda"
-    x = torch.randn(num_tokens, hidden_size, dtype=torch.float16, device=device) * 0.1
-    w13 = torch.randn(num_experts, hidden_size, 2 * inter_size, dtype=torch.float16, device=device) * 0.05
-    w2 = torch.randn(num_experts, inter_size, hidden_size, dtype=torch.float16, device=device) * 0.05
-
-    out_triton = fused_moe_mlp(x, w13, w2, group_sizes)
-    out_ref = reference_moe_mlp(x, w13, w2, group_sizes)
-
-    diff = (out_triton.float() - out_ref.float()).abs()
-    print("max abs diff:", diff.max().item())
-    print("mean abs diff:", diff.mean().item())
-    torch.testing.assert_close(out_triton, out_ref.to(torch.float16), atol=2e-2, rtol=2e-2)
-    print("OK: two-kernel version matches reference")
