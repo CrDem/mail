@@ -2,6 +2,24 @@ import torch
 import triton
 import triton.language as tl
 
+@triton.autotune(
+    configs=[
+        triton.Config( {
+                "BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_N2": 64, "BLOCK_K": 64, }, ),
+        triton.Config( {
+                "BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_N2": 64, "BLOCK_K": 128, }, ),
+        triton.Config( {
+                "BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_N2": 128, "BLOCK_K": 64, }, ),
+        triton.Config( {
+                "BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_N2": 64, "BLOCK_K": 64, }, ),
+        triton.Config( {
+                "BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_N2": 128, "BLOCK_K": 128, }, ),
+        triton.Config( {
+                "BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_N2": 128, "BLOCK_K": 128, }, ),
+        
+    ],
+    key=["hidden_size", "inter_size"],
+)
 @triton.jit
 def _megaMOE_kernel(
     x_ptr, w13_ptr, w2_ptr, out_ptr,
