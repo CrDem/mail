@@ -81,20 +81,12 @@ def _grouped_gemm1_swiglu_kernel(
     rows = tl.cast(row_start + offs_m, tl.int64)
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_n2_base = pid_n * BLOCK_N + tl.arange(0, BLOCK_N*2)
-
     n_mask = offs_n < inter_size
-    n2_mask = tl.broadcast_to( n_mask[:, None], (BLOCK_N, 2) ).reshape(BLOCK_N * 2)
-
-    # gate0..gateN-1, up0..upN-1
-    offs_n2 = (
-        (offs_n2_base & (BLOCK_N - 1))
-        + (offs_n2_base >> tl.log2(BLOCK_N)) * inter_size
-    )
 
     w13_base = w13_ptr + expert_id * stride_w13_e
 
-    acc_gate_up = tl.zeros((BLOCK_M, BLOCK_N*2), dtype=tl.float32)
+    acc_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_up = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     for k0 in range(0, hidden_size, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)
@@ -103,20 +95,20 @@ def _grouped_gemm1_swiglu_kernel(
         x_ptrs = x_ptr + rows[:, None] * stride_xm + offs_k[None, :] * stride_xk
         x_tile = tl.load(x_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
 
-        gate_up_ptrs = (
-            w13_base + offs_k[:, None] * stride_w13_k + offs_n2[None, :] * stride_w13_n )
+        gate_ptrs = (
+            w13_base + offs_k[:, None] * stride_w13_k + offs_n[None, :] * stride_w13_n )
+        up_ptrs = (
+            w13_base + offs_k[:, None] * stride_w13_k + (offs_n[None, :] + inter_size) * stride_w13_n )
 
-        gate_up_w = tl.load(gate_up_ptrs, mask=k_mask[:, None] & n2_mask[None, :], other=0.0)
+        gate_w = tl.load(gate_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+        up_w = tl.load(up_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
 
-        acc_gate_up = tl.dot(x_tile, gate_up_w, acc_gate_up)
-
-    # split
-    gate = acc_gate_up[:, :BLOCK_N]
-    up   = acc_gate_up[:, BLOCK_N:]
+        acc_gate = tl.dot(x_tile, gate_w, acc_gate)
+        acc_up = tl.dot(x_tile, up_w, acc_up)
 
     # SwiGLU
-    silu_gate = gate * tl.sigmoid(gate)
-    hidden_tile = (silu_gate * up).to(hidden_ptr.dtype.element_ty)
+    silu_gate = acc_gate * tl.sigmoid(acc_gate)
+    hidden_tile = (silu_gate * acc_up).to(hidden_ptr.dtype.element_ty)
 
     hidden_ptrs = hidden_ptr + rows[:, None] * stride_hm + offs_n[None, :] * stride_hn
     tl.store(hidden_ptrs, hidden_tile, mask=m_mask[:, None] & n_mask[None, :])
