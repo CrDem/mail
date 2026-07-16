@@ -17,6 +17,7 @@ def _megaMOE_kernel(
     BLOCK_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
+    pid_n2 = tl.program_id(1)
 
     expert_id = tl.load(tile_expert_ptr + pid_m)
     row_start = tl.load(tile_row_start_ptr + pid_m)
@@ -151,6 +152,7 @@ def _megaMOE_kernel_1d(
             else:
                 prev_values = tl.load(out_ptrs, mask=m_mask[:, None] & o_mask[None, :], other=0.0)
                 tl.store(out_ptrs, prev_values + acc_out, mask=m_mask[:, None] & o_mask[None, :])
+                
 
 def build_tile_schedule(group_sizes: torch.Tensor, num_tokens: int, BLOCK_M: int):
     device = group_sizes.device
