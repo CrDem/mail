@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+import triton.language.extra.cann.extension as extension
 
 @triton.jit
 def _locate_tile(pid_m, group_sizes_ptr, num_experts, BLOCK_M: tl.constexpr):
@@ -127,13 +128,15 @@ def _megaMOE_kernel_ext(
         return
 
     acc_out = tl.zeros((BLOCK_M, BLOCK_N2), dtype=tl.float32)
+    hidden_tile_big = tl.zeros((BLOCK_M, inter_size), dtype=tl.bfloat16)
+    w2_tile_big = tl.zeros((inter_size, BLOCK_N2), dtype=tl.bfloat16)
 
     W2_block_ptr = tl.make_block_ptr( # assert inter // BLOCK_N2 == 0
             base = w2_ptr,
             shape=(num_experts * inter_size, hidden_size),
             strides=(stride_w2_k, stride_w2_n),
 
-            offsets=(expert_id.to(tl.int32) * inter_size + n0, pid_n2 * BLOCK_N2),
+            offsets=(expert_id.to(tl.int32) * inter_size, pid_n2 * BLOCK_N2),
             block_shape=(BLOCK_N, BLOCK_N2),
             order=(1, 0),
         )
@@ -201,9 +204,12 @@ def _megaMOE_kernel_ext(
         w2_tile = tl.load(W2_block_ptr, boundary_check=(0,1), padding_option="zero")
         W2_block_ptr = tl.advance(W2_block_ptr, (BLOCK_N, 0))
 
-        acc_out = tl.dot(hidden_tile, w2_tile, acc_out)
+        hidden_tile_big = extension.insert_slice(hidden_tile_big, hidden_tile, (0, n0), (BLOCK_M, BLOCK_N), (inter_size, 1))
+        w2_tile_big = extension.insert_slice(w2_tile_big, w2_tile, (n0, 0), (BLOCK_N, BLOCK_N2), (BLOCK_N2, 1))
 
-    tl.store(Out_block_ptr, acc_out, boundary_check=(0,1))
+    acc_out = tl.dot(hidden_tile_big, w2_tile_big, acc_out)
+
+    tl.store(Out_block_ptr, acc_out.to(out_ptr.dtype.element_ty), boundary_check=(0,1))
 
 @triton.jit
 def _megaMOE_kernel_1d(
