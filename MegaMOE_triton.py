@@ -426,7 +426,122 @@ def _megaMOE_kernel_1d_ext(
         w2_tile = tl.load(W2_block_ptr, boundary_check=(0,1), padding_option="zero")
         W2_block_ptr = tl.advance(W2_block_ptr, (0, BLOCK_N2))
 
-        acc_out = tl.dot(hidden_tile_big, w2_tile, acc_out)
+        acc_out = tl.dot(hidden_tile_big, w2_tile, acc_out).to(out_ptr.dtype.element_ty)
+
+        tl.store(Out_block_ptr, acc_out, boundary_check=(0,1))
+        Out_block_ptr = tl.advance(Out_block_ptr, (0, BLOCK_N2))
+
+@triton.jit
+def _megaMOE_kernel_1d_ext_gmm1opt(
+    x_ptr, w13_ptr, w2_ptr, out_ptr,
+    group_sizes_ptr,
+    num_tokens: tl.constexpr,
+    hidden_size: tl.constexpr,
+    inter_size: tl.constexpr,
+    num_experts: tl.constexpr,
+    stride_xm, stride_xk,
+    stride_w13_e, stride_w13_k, stride_w13_n,
+    stride_w2_e, stride_w2_k, stride_w2_n,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_N2: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+
+    expert_id, row_start, row_count = _locate_tile(pid_m, group_sizes_ptr, num_experts, BLOCK_M)
+    if row_count == 0:
+        return
+    
+    hidden_tile_big = tl.zeros((BLOCK_M, inter_size), dtype=tl.float32)
+    hidden_tile_big_additional = tl.zeros((BLOCK_M, inter_size), dtype=tl.float32)
+
+    # gmm1
+    X_block_ptr = tl.make_block_ptr(
+            base = x_ptr + row_start * stride_xm,
+            shape=(row_count.to(tl.int32), hidden_size),
+            strides=(stride_xm, stride_xk),
+
+            offsets=(0, 0),
+            block_shape=(BLOCK_M, BLOCK_K),
+            order=(1, 0),
+        )
+
+    for k0 in range(0, hidden_size, BLOCK_K):
+        W13_gate_block_ptr = tl.make_block_ptr( # assert hidden // BLOCK_K == 0
+            base = w13_ptr,
+            shape=(num_experts * hidden_size, inter_size*2),
+            strides=(stride_w13_k, stride_w13_n),
+
+            offsets=(expert_id.to(tl.int32) * hidden_size + k0, 0),
+            block_shape=(BLOCK_K, BLOCK_N),
+            order=(1, 0),
+        )
+
+        W13_up_block_ptr = tl.make_block_ptr(
+            base = w13_ptr,
+            shape=(num_experts * hidden_size, inter_size*2),
+            strides=(stride_w13_k, stride_w13_n),
+
+            offsets=(expert_id.to(tl.int32) * hidden_size + k0, inter_size),
+            block_shape=(BLOCK_K, BLOCK_N),
+            order=(1, 0),
+        )
+
+        x_tile = tl.load(X_block_ptr, boundary_check=(0,1), padding_option="zero")
+        X_block_ptr = tl.advance(X_block_ptr, (0, BLOCK_K))
+
+        for n0 in range(0, inter_size, BLOCK_N):
+            
+            acc_gate = extension.extract_slice(hidden_tile_big, (0, n0), (BLOCK_M, BLOCK_N), (1, 1))
+            acc_up = extension.extract_slice(hidden_tile_big_additional, (0, n0), (BLOCK_M, BLOCK_N), (1, 1))
+
+            gate_w = tl.load(W13_gate_block_ptr, boundary_check=(0,1), padding_option="zero")
+            up_w = tl.load(W13_up_block_ptr, boundary_check=(0,1), padding_option="zero")
+
+            W13_gate_block_ptr = tl.advance(W13_gate_block_ptr, (0, BLOCK_N))
+            W13_up_block_ptr = tl.advance(W13_up_block_ptr, (0, BLOCK_N))
+
+            acc_gate = tl.dot(x_tile, gate_w, acc_gate)
+            acc_up = tl.dot(x_tile, up_w, acc_up)
+
+            hidden_tile_big = extension.insert_slice(hidden_tile_big, acc_gate, (0, n0), (BLOCK_M, BLOCK_N), (1, 1))
+            hidden_tile_big_additional = extension.insert_slice(hidden_tile_big_additional, acc_up, (0, n0), (BLOCK_M, BLOCK_N), (1, 1))
+
+    # SwiGLU
+    hidden_tile_big = hidden_tile_big * tl.sigmoid(hidden_tile_big)
+    hidden_tile_big = (hidden_tile_big * hidden_tile_big_additional)
+
+    # gmm2
+    W2_block_ptr = tl.make_block_ptr( # assert inter // BLOCK_N2 == 0
+            base = w2_ptr,
+            shape=(num_experts * inter_size, hidden_size),
+            strides=(stride_w2_k, stride_w2_n),
+
+            offsets=(expert_id.to(tl.int32) * inter_size, 0),
+            block_shape=(inter_size, BLOCK_N2),
+            order=(1, 0),
+        )
+    
+    Out_block_ptr = tl.make_block_ptr(
+            base = out_ptr + row_start * stride_om,
+            shape=(row_count.to(tl.int32), hidden_size),
+            strides=(stride_om, stride_on),
+
+            offsets=(0, 0),
+            block_shape=(BLOCK_M, BLOCK_N2),
+            order=(1, 0),
+        )
+
+    hidden_tile_big = hidden_tile_big.to(w2_ptr.dtype.element_ty)
+    for n2 in range(0, hidden_size, BLOCK_N2):
+        acc_out = tl.zeros((BLOCK_M, BLOCK_N2), dtype=tl.float32)
+
+        w2_tile = tl.load(W2_block_ptr, boundary_check=(0,1), padding_option="zero")
+        W2_block_ptr = tl.advance(W2_block_ptr, (0, BLOCK_N2))
+
+        acc_out = tl.dot(hidden_tile_big, w2_tile, acc_out).to(out_ptr.dtype.element_ty)
 
         tl.store(Out_block_ptr, acc_out, boundary_check=(0,1))
         Out_block_ptr = tl.advance(Out_block_ptr, (0, BLOCK_N2))
