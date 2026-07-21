@@ -217,7 +217,6 @@ def _megaMOE_kernel_ext(
 def _megaMOE_kernel_1d(
     x_ptr, w13_ptr, w2_ptr, out_ptr,
     group_sizes_ptr,
-    num_tokens: tl.constexpr, 
     hidden_size: tl.constexpr, 
     inter_size: tl.constexpr,
     num_experts: tl.constexpr,
@@ -326,7 +325,6 @@ def _megaMOE_kernel_1d(
 def _megaMOE_kernel_1d_ext(
     x_ptr, w13_ptr, w2_ptr, out_ptr,
     group_sizes_ptr,
-    num_tokens: tl.constexpr,
     hidden_size: tl.constexpr,
     inter_size: tl.constexpr,
     num_experts: tl.constexpr,
@@ -432,10 +430,118 @@ def _megaMOE_kernel_1d_ext(
         Out_block_ptr = tl.advance(Out_block_ptr, (0, BLOCK_N2))
 
 @triton.jit
+def _megaMOE_kernel_1d_ext_gmm1opt_simple(
+    x_ptr, w13_ptr, w2_ptr, out_ptr,
+    group_sizes_ptr,
+    hidden_size: tl.constexpr,
+    inter_size: tl.constexpr,
+    num_experts: tl.constexpr,
+    stride_xm, stride_xk,
+    stride_w13_e, stride_w13_k, stride_w13_n,
+    stride_w2_e, stride_w2_k, stride_w2_n,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_N2: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+
+    expert_id, row_start, row_count = _locate_tile(pid_m, group_sizes_ptr, num_experts, BLOCK_M)
+    if row_count == 0:
+        return
+    
+    hidden_tile_big = tl.zeros((BLOCK_M, inter_size), dtype=x_ptr.dtype.element_ty)
+
+    X_block_ptr = tl.make_block_ptr(
+            base = x_ptr + row_start * stride_xm,
+            shape=(row_count.to(tl.int32), hidden_size),
+            strides=(stride_xm, stride_xk),
+
+            offsets=(0, 0),
+            block_shape=(BLOCK_M, hidden_size),
+            order=(1, 0),
+        )
+    x_tile_big = tl.load(X_block_ptr, boundary_check=(0,1), padding_option="zero")
+
+    for n0 in range(0, inter_size, BLOCK_N):
+
+        acc_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        acc_up = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        W13_gate_block_ptr = tl.make_block_ptr( # assert hidden // BLOCK_K == 0
+            base = w13_ptr,
+            shape=(num_experts * hidden_size, inter_size*2),
+            strides=(stride_w13_k, stride_w13_n),
+
+            offsets=(expert_id.to(tl.int32) * hidden_size, n0),
+            block_shape=(BLOCK_K, BLOCK_N),
+            order=(1, 0),
+        )
+
+        W13_up_block_ptr = tl.make_block_ptr(
+            base = w13_ptr,
+            shape=(num_experts * hidden_size, inter_size*2),
+            strides=(stride_w13_k, stride_w13_n),
+
+            offsets=(expert_id.to(tl.int32) * hidden_size, n0 + inter_size),
+            block_shape=(BLOCK_K, BLOCK_N),
+            order=(1, 0),
+        )
+
+        for k0 in range(0, hidden_size, BLOCK_K):
+            x_tile = extension.extract_slice(x_tile_big, (0, k0), (BLOCK_M, BLOCK_K), (1, 1))
+            gate_w = tl.load(W13_gate_block_ptr, boundary_check=(0,1), padding_option="zero")
+            up_w = tl.load(W13_up_block_ptr, boundary_check=(0,1), padding_option="zero")
+
+            X_block_ptr = tl.advance(X_block_ptr, (0, BLOCK_K))
+            W13_gate_block_ptr = tl.advance(W13_gate_block_ptr, (BLOCK_K, 0))
+            W13_up_block_ptr = tl.advance(W13_up_block_ptr, (BLOCK_K, 0))
+
+            acc_gate = tl.dot(x_tile, gate_w, acc_gate)
+            acc_up = tl.dot(x_tile, up_w, acc_up)
+
+        # SwiGLU
+        silu_gate = acc_gate * tl.sigmoid(acc_gate)
+        hidden_tile = (silu_gate * acc_up).to(w2_ptr.dtype.element_ty)
+
+        hidden_tile_big = extension.insert_slice(hidden_tile_big, hidden_tile, (0, n0), (BLOCK_M, BLOCK_N), (1, 1))
+
+    W2_block_ptr = tl.make_block_ptr( # assert inter // BLOCK_N2 == 0
+            base = w2_ptr,
+            shape=(num_experts * inter_size, hidden_size),
+            strides=(stride_w2_k, stride_w2_n),
+
+            offsets=(expert_id.to(tl.int32) * inter_size, 0),
+            block_shape=(inter_size, BLOCK_N2),
+            order=(1, 0),
+        )
+    
+    Out_block_ptr = tl.make_block_ptr(
+            base = out_ptr + row_start * stride_om,
+            shape=(row_count.to(tl.int32), hidden_size),
+            strides=(stride_om, stride_on),
+
+            offsets=(0, 0),
+            block_shape=(BLOCK_M, BLOCK_N2),
+            order=(1, 0),
+        )
+    
+    for n2 in range(0, hidden_size, BLOCK_N2):
+        acc_out = tl.zeros((BLOCK_M, BLOCK_N2), dtype=tl.float32)
+
+        w2_tile = tl.load(W2_block_ptr, boundary_check=(0,1), padding_option="zero")
+        W2_block_ptr = tl.advance(W2_block_ptr, (0, BLOCK_N2))
+
+        acc_out = tl.dot(hidden_tile_big, w2_tile, acc_out).to(out_ptr.dtype.element_ty)
+
+        tl.store(Out_block_ptr, acc_out, boundary_check=(0,1))
+        Out_block_ptr = tl.advance(Out_block_ptr, (0, BLOCK_N2))
+
+@triton.jit
 def _megaMOE_kernel_1d_ext_gmm1opt(
     x_ptr, w13_ptr, w2_ptr, out_ptr,
     group_sizes_ptr,
-    num_tokens: tl.constexpr,
     hidden_size: tl.constexpr,
     inter_size: tl.constexpr,
     num_experts: tl.constexpr,
@@ -550,7 +656,6 @@ def _megaMOE_kernel_1d_ext_gmm1opt(
 def _megaMOE_kernel_1d_ext_tiled(
     x_ptr, w13_ptr, w2_ptr, out_ptr,
     group_sizes_ptr,
-    num_tokens: tl.constexpr, 
     hidden_size: tl.constexpr, 
     inter_size: tl.constexpr,
     num_experts: tl.constexpr,
@@ -702,7 +807,7 @@ def megaMOE_kernel(
     _megaMOE_kernel_1d[grid](
         x, w13, w2, out,
         group_sizes,#tile_expert_t, tile_row_start_t, tile_row_count_t,#
-        num_tokens, hidden_size, inter_size, num_experts,
+        hidden_size, inter_size, num_experts,
         x.stride(0), x.stride(1),
         w13.stride(0), w13.stride(1), w13.stride(2),
         w2.stride(0), w2.stride(1), w2.stride(2),
@@ -713,7 +818,7 @@ def megaMOE_kernel(
     '''_megaMOE_kernel_1d_ext_tiled[grid](
         x, w13, w2, out,
         group_sizes,#tile_expert_t, tile_row_start_t, tile_row_count_t,#
-        num_tokens, hidden_size, inter_size, num_experts,
+        hidden_size, inter_size, num_experts,
         x.stride(0), x.stride(1),
         w13.stride(0), w13.stride(1), w13.stride(2),
         w2.stride(0), w2.stride(1), w2.stride(2),
@@ -724,7 +829,7 @@ def megaMOE_kernel(
     '''_megaMOE_kernel_1d_ext_tiled_generalized[grid](
         x, w13, w2, out,
         group_sizes,#tile_expert_t, tile_row_start_t, tile_row_count_t,#
-        num_tokens, hidden_size, inter_size, 768, num_experts,
+        hidden_size, inter_size, 768, num_experts,
         x.stride(0), x.stride(1),
         w13.stride(0), w13.stride(1), w13.stride(2),
         w2.stride(0), w2.stride(1), w2.stride(2),
