@@ -1,11 +1,46 @@
 import time
 import traceback
+import argparse
 
 import torch
 
-from safetensors import safe_open
+#from megaMOE_triton import megaMOE_kernel
+from sgl_kernel_npu.moe.mega_moe import megaMOE_kernel
 
-from partially_fused_moe_mlp_triton import fused_moe_mlp, grouped_gemm2, swiglu_triton
+
+AUTOTUNE_CONFIGS = [
+    # M=32
+    (32, 128, 256, 128),
+    (32, 128, 256, 256),
+    # M=128
+    (128, 64, 64, 64),
+    (128, 64, 64, 128),
+    (128, 64, 64, 256),
+    (128, 64, 128, 64),
+    (128, 64, 128, 128),
+    (128, 64, 128, 256),
+    (128, 64, 256, 64),
+    (128, 64, 256, 128),
+    (128, 64, 256, 256),
+    (128, 128, 64, 64),
+    (128, 128, 64, 128),
+    (128, 128, 64, 256),
+    (128, 128, 128, 64),
+    (128, 128, 128, 128),
+    (128, 128, 128, 256),
+    (128, 128, 256, 64),
+    (128, 128, 256, 128),
+    (128, 128, 256, 256),
+    (128, 256, 64, 64),
+    (128, 256, 64, 128),
+    (128, 256, 64, 256),
+    (128, 256, 128, 64),
+    (128, 256, 128, 128),
+    (128, 256, 128, 256),
+    (128, 256, 256, 64),
+    (128, 256, 256, 128),
+    (128, 256, 256, 256),
+]
 
 
 def reference_moe_mlp(x, w13, w2, expert_tokens):
@@ -36,24 +71,131 @@ def reference_moe_mlp(x, w13, w2, expert_tokens):
 
     return hidden_states
 
+
+def make_moe_tensors(num_tokens, hidden_size, inter_size, num_experts, device, dtype):
+    x = torch.empty(
+        num_tokens,
+        hidden_size,
+        dtype=dtype,
+        device=device,
+    ).normal_(mean=0.0, std=0.5)
+
+    w13 = torch.empty(
+        num_experts,
+        hidden_size,
+        2 * inter_size,
+        dtype=dtype,
+        device=device,
+    ).normal_(mean=0.0, std=0.5)
+
+    w2 = torch.empty(
+        num_experts,
+        inter_size,
+        hidden_size,
+        dtype=dtype,
+        device=device,
+    ).normal_(mean=0.0, std=0.5)
+
+    return x, w13, w2
+
+
+def check_correctness(x, w13, w2, group_sizes, repeats=5):
+    ref = None
+    out = None
+
+    for _ in range(repeats):
+        ref = reference_moe_mlp(
+            x,
+            w13,
+            w2,
+            group_sizes,
+        )
+
+        torch.npu.synchronize()
+        out = megaMOE_kernel(
+            x,
+            w13,
+            w2,
+            group_sizes,
+        )
+        torch.npu.synchronize()
+
+    torch.npu.synchronize()
+
+    diff_golden = (ref - out).abs()
+    print(f"diff_golden (Max Diff): {diff_golden.max().item()}")
+    torch.testing.assert_close(
+        out,
+        ref,
+        rtol=0.0,
+        atol=1e-2,
+    )
+
+    print("Correctness OK")
+
+
+def run_moe_benchmark(
+    x,
+    w13,
+    w2,
+    group_sizes,
+    warmup_iters,
+    bench_iters,
+    BLOCK_M=None,
+    BLOCK_N=None,
+    BLOCK_N2=None,
+    BLOCK_K=None,
+):
+    """
+    Прогоняет вармап + замер megaMOE_kernel.
+    Если размеры блоков не заданы (None) - кернел вызывается без них.
+    Возвращает суммарное время (в секундах) на bench_iters итераций.
+    """
+
+    kwargs = {}
+    if None not in (BLOCK_M, BLOCK_N, BLOCK_N2, BLOCK_K):
+        kwargs = dict(
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_N2=BLOCK_N2,
+            BLOCK_K=BLOCK_K,
+        )
+
+    #
+    # warmup
+    #
+
+    for _ in range(warmup_iters):
+        megaMOE_kernel(x, w13, w2, group_sizes, **kwargs)
+        torch.npu.synchronize()
+
+    torch.npu.synchronize()
+
+    #
+    # benchmark
+    #
+
+    t0 = time.perf_counter()
+
+    for _ in range(bench_iters):
+        megaMOE_kernel(x, w13, w2, group_sizes, **kwargs)
+        torch.npu.synchronize()
+
+    torch.npu.synchronize()
+    t1 = time.perf_counter()
+
+    return t1 - t0
+
+
 def autotune_fused_moe(
     x,
     w13,
     w2,
     group_sizes,
+    configs=AUTOTUNE_CONFIGS,
     warmup=20,
     iters=100,
 ):
-
-    configs = [
-        (16, 64, 64, 64),
-        (32, 64, 64, 64),
-        (32, 64, 128, 64),
-        (32, 128, 64, 64),
-        (32, 64, 128, 128),
-        (64, 64, 64, 64),
-        (64, 128, 128, 64),
-    ]
 
     best_cfg = None
     best_time = float("inf")
@@ -63,47 +205,19 @@ def autotune_fused_moe(
     for BLOCK_M, BLOCK_N, BLOCK_N2, BLOCK_K in configs:
 
         try:
-
-            #
-            # warmup
-            #
-
-            for _ in range(warmup):
-                fused_moe_mlp(
-                    x,
-                    w13,
-                    w2,
-                    group_sizes,
-                    BLOCK_M=BLOCK_M,
-                    BLOCK_N=BLOCK_N,
-                    BLOCK_N2=BLOCK_N2,
-                    BLOCK_K=BLOCK_K,
-                )
-
-            torch.npu.synchronize()
-
-            #
-            # benchmark
-            #
-
-            t0 = time.perf_counter()
-
-            for _ in range(iters):
-                fused_moe_mlp(
-                    x,
-                    w13,
-                    w2,
-                    group_sizes,
-                    BLOCK_M=BLOCK_M,
-                    BLOCK_N=BLOCK_N,
-                    BLOCK_N2=BLOCK_N2,
-                    BLOCK_K=BLOCK_K,
-                )
-
-            torch.npu.synchronize()
-            t1 = time.perf_counter()
-
-            elapsed = (t1 - t0) / iters
+            elapsed_total = run_moe_benchmark(
+                x,
+                w13,
+                w2,
+                group_sizes,
+                warmup_iters=warmup,
+                bench_iters=iters,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                BLOCK_N2=BLOCK_N2,
+                BLOCK_K=BLOCK_K,
+            )
+            elapsed = elapsed_total / iters
 
             print(
                 f"M={BLOCK_M:3d} "
@@ -136,12 +250,15 @@ def autotune_fused_moe(
 
     return best_cfg
 
-def benchmark(hidden_size, inter_size, checkAccuracy=True, checkPerf=True):
+
+def benchmark(hidden_size, inter_size, checkAccuracy=True, checkPerf=True, autotune=False):
+    print("=" * 70)
+    print(f"Testing Kernel")
     device = torch.device("npu")
 
     num_experts = 128
 
-    '''group_sizes = [
+    group_sizes = [
         13, 14, 20, 13, 10, 6, 20, 14, 29, 5, 3, 2, 2, 11, 10, 16,
         60, 18, 9, 12, 14, 16, 15, 15, 11, 13, 20, 13, 22, 6, 6, 21,
         10, 29, 13, 23, 22, 11, 9, 26, 2, 13, 4, 27, 9, 25, 5, 6,
@@ -149,155 +266,44 @@ def benchmark(hidden_size, inter_size, checkAccuracy=True, checkPerf=True):
         8, 23, 11, 15, 7, 15, 10, 6, 14, 4, 14, 30, 34, 4, 8, 10,
         10, 11, 18, 14, 28, 37, 11, 5, 14, 31, 8, 8, 5, 4, 5, 21,
         28, 15, 7, 23, 15, 6, 70, 23, 23, 6, 1, 22, 11, 12, 38, 12,
-        8, 14, 11, 15, 18, 14, 12, 4, 3, 11, 2, 37, 14, 21, 41, 18,
+        0, 31, 32, 33, 63, 64, 65, 0, 31, 32, 33, 63, 64, 65, 1, 0,
     ]
-    group_sizes = torch.tensor([
-        # пустые эксперты
-        0, 0,
 
-        # совсем маленькие
-        1, 2, 3, 4, 5, 7, 8,
-
-        # около половины блока
-        31, 32, 33,
-        63, 64, 65,
-
-        # вокруг BLOCK_M
-        127, 128, 129,
-
-        # чуть больше
-        130, 131, 150,
-
-        # несколько тайлов
-        255, 256, 257,
-
-        # три тайла
-        383, 384, 385,
-
-        # четыре тайла
-        511, 512, 513,
-
-        # большие
-        777,
-        1000,
-
-        # опять пустые
-        0, 0,
-
-        # случайные маленькие
-        17, 9, 41, 6, 11,
-
-        # снова около BLOCK_M
-        126, 127, 128, 129, 130,
-
-        # огромные
-        1023, 1024, 1025,
-
-        # хвост
-        13, 27, 2, 19, 0, 8
-    ], dtype=torch.int64, device=device)
-
-    group_sizes = torch.tensor(group_sizes, dtype=torch.int64, device=device)'''
+    group_sizes = torch.tensor(group_sizes, dtype=torch.int64, device=device)
 
     num_tokens = int(group_sizes.sum().cpu())
 
-    '''x = torch.empty(
+    x, w13, w2 = make_moe_tensors(
         num_tokens,
         hidden_size,
-        dtype=torch.bfloat16,
-        device=device,
-    ).normal_(mean=0.0, std=0.5)'''
-
-
-    w13_list = []
-    w2_list = []
-    with safe_open(
-        "/home/akuznetsov/t1/sglang/model-00001-of-00016.safetensors",
-        framework="pt",
-        device="cpu",
-    ) as f:
-        for expert_id in range(num_experts):
-            gate = f.get_tensor( f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight" )
-            up = f.get_tensor( f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight" )
-            gate_up = torch.cat([gate, up], dim=0)
-            w13_list.append(gate_up)
-
-            w2_part = f.get_tensor( f"model.layers.0.mlp.experts.{expert_id}.down_proj.weight" )
-            w2_list.append(w2_part)
-
-
-    w13 = torch.stack(w13_list, dim=0)
-    w13 = w13.to('npu')
-    w13 = torch.transpose(w13, 1, 2)
-
-    w2 = torch.stack(w2_list, dim=0)
-    w2 = w2.to('npu')
-    w2 = torch.transpose(w2, 1, 2)
-
-    print(f"type(w13): {type(w13)}")
-    print(f"w13.dtype: {w13.dtype}")
-    print(f"w13.shape: {w13.shape}")
-
-    print(f"type(w2): {type(w2)}")
-    print(f"w2.dtype: {w2.dtype}")
-    print(f"w2.shape: {w2.shape}")
-
-    '''w13 = torch.empty(
-        num_experts,
-        hidden_size,
-        2 * inter_size,
-        dtype=torch.bfloat16,
-        device=device,
-    ).normal_(mean=0.0, std=0.5)
-
-    w2 = torch.empty(
-        num_experts,
         inter_size,
-        hidden_size,
-        dtype=torch.bfloat16,
-        device=device,
-    ).normal_(mean=0.0, std=0.5)'''
+        num_experts,
+        device,
+        torch.bfloat16,
+    )
 
-    if (checkAccuracy):
-        #
-        # correctness
-        #
+    if checkAccuracy:
+        check_correctness(x, w13, w2, group_sizes)
 
-        ref = reference_moe_mlp(
+    if checkPerf:
+
+        if autotune:
+            BLOCK_M, BLOCK_N, BLOCK_N2, BLOCK_K = autotune_fused_moe(x, w13, w2, group_sizes)
+        else:
+            BLOCK_M = BLOCK_N = BLOCK_N2 = BLOCK_K = None
+
+        elapsed_triton = run_moe_benchmark(
             x,
             w13,
             w2,
             group_sizes,
+            warmup_iters=100,
+            bench_iters=1000,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_N2=BLOCK_N2,
+            BLOCK_K=BLOCK_K,
         )
-
-        out = fused_moe_mlp(
-            x,
-            w13,
-            w2,
-            group_sizes,
-            BLOCK_M=32,
-            BLOCK_N=32,
-            BLOCK_K=32,
-        )
-
-        torch.npu.synchronize()
-
-        torch.testing.assert_close(
-            out,
-            ref,
-            rtol=1e-2,
-            atol=1e-2,
-        )
-
-        print("Correctness OK")
-
-    if (checkPerf):
-
-        autotune_fused_moe()
-
-        #
-        # benchmark npu
-        #
 
         startNPU = time.perf_counter()
         for _ in range(1000):
@@ -307,67 +313,47 @@ def benchmark(hidden_size, inter_size, checkAccuracy=True, checkPerf=True):
                 w2,
                 group_sizes,
             )
+            torch.npu.synchronize()
 
         torch.npu.synchronize()
         endNPU = time.perf_counter()
 
         print(
             f"hidden={hidden_size:<5} "
-            f"inter={inter_size:<5} "
-            f"NPU ops: {(endNPU - startNPU):.3f} ms"
+            f"inter={inter_size:<5} \n"
+            f"Triton kernel: {elapsed_triton * 1000:.3f} ms\n"
+            f"NPU ops: {(endNPU - startNPU) * 1000:.3f} ms"
         )
 
-def test_swiglu(inter_size):
-
-    device = torch.device("npu")
-    num_tokens = 2048
-
-    gate = torch.empty(
-        num_tokens,
-        inter_size,
-        dtype=torch.bfloat16,
-        device=device,
-    ).normal_(mean=0.0, std=0.5)
-
-    up = torch.empty(
-        num_tokens,
-        inter_size,
-        dtype=torch.bfloat16,
-        device=device,
-    ).normal_(mean=0.0, std=0.5)
-
-    out = torch.empty(
-        num_tokens,
-        inter_size,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-
-    swiglu_triton(
-        torch.cat((gate, up), dim=-1),
-        out,
-        num_tokens,
-        inter_size
-    )
-
-    ref = torch.ops.npu.npu_swiglu(torch.cat((gate, up), dim=-1))
-
-    torch.testing.assert_close(
-        out,
-        ref,
-        rtol=0.0,
-        atol=1e-2,
-    )
-
-    print("Correctness OK")
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--check-accuracy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Проверять корректность (сравнение с reference_moe_mlp)",
+    )
+    parser.add_argument(
+        "--check-perf",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Замерять производительность",
+    )
+    parser.add_argument(
+        "--autotune",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Автотюнить размеры блоков перед замером производительности",
+    )
+    args = parser.parse_args()
+
     cases = [
-        (128, 256),
-        (512, 1024),
-        (1024, 2048),
-        (4096, 2048),
-        (2048, 768),
+        #(128, 256),
+        #(512, 1024),
+        #(2560, 1280),
+        #(4096, 2048),
+        (2048, 768), # qwen3-30b: hidden = 2048, inter = 768
     ]
 
     for hidden, inter in cases:
@@ -375,7 +361,13 @@ def main():
         print(f"Testing hidden={hidden}, inter={inter}")
 
         try:
-            benchmark(hidden, inter, checkAccuracy=False, checkPerf=True)
+            benchmark(
+                hidden,
+                inter,
+                checkAccuracy=args.check_accuracy,
+                checkPerf=args.check_perf,
+                autotune=args.autotune,
+            )
         except Exception:
             traceback.print_exc()
             break
@@ -383,17 +375,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-''' save tensors:
-import os
-import torch
-
-save_dir = "moe_debug"
-os.makedirs(save_dir, exist_ok=True)
-
-torch.save(hidden_states.cpu(), os.path.join(save_dir, "hidden_states.pt"))
-torch.save(expert_tokens.cpu(), os.path.join(save_dir, "expert_tokens.pt"))
-
-print(f"Saved hidden_states: {hidden_states.shape}, {hidden_states.dtype}")
-print(f"Saved expert_tokens: {expert_tokens.shape}, {expert_tokens.dtype}")
-'''
