@@ -71,6 +71,73 @@ import triton.language as tl
 
 # _gather и cube1 — твои существующие @triton.jit-помощники.
 
+@triton.jit
+def _gather(
+    dst_ptr,
+    src_ptr,
+    Indices_ptr,
+    # Strides for indices
+    stride_it1, stride_in2, stride_ik,
+    # Strides for dst
+    stride_dt1, stride_dn2, stride_dsbs, stride_dd,
+    # Strides for src
+    stride_st2, stride_sn2, stride_s1, stride_sd,
+    # Params
+    D: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_D_VEC: tl.constexpr,
+    # Meta
+    actual_sel_blk,
+    dst_base,
+    src_base,
+    topk_base,
+    cur_s2,
+):
+    # Сколько строк собирается за одну итерацию. Раньше было по одной, и на
+    # каждую приходились скалярная загрузка индекса, ветвление и отдельный DMA
+    # на 1152 байта — 109 тактов на чтение и 98 на запись, то есть ~10.6 Б/такт
+    # против 18-76 Б/такт у крупных копий. Упирается не в полосу, а в оверхед
+    # на транзакцию, поэтому строки собираются пачкой.
+    # Это первая ручка для подбора: 8 -> 9 КБ на тайл, 16 -> 18 КБ, 32 -> 37 КБ.
+    BLOCK_ROWS: tl.constexpr = 8
+
+    D_loop_times: tl.constexpr = (D + BLOCK_D_VEC - 1) // BLOCK_D_VEC
+    row_loop_times = tl.cdiv(actual_sel_blk, BLOCK_ROWS)
+
+    for idx_row_blk in range(0, row_loop_times):
+        rows = idx_row_blk * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+        row_in_range = rows < actual_sel_blk
+
+        sparse_ids = tl.load(
+            Indices_ptr + topk_base + rows * stride_ik,
+            mask=row_in_range,
+            other=-1,
+        )
+        # Ветвление if sparse_id >= 0 стало маской: невалидные строки не
+        # читаются и не пишутся, приёмник сохраняет прежнее содержимое —
+        # ровно как в исходной версии.
+        row_valid = row_in_range & (sparse_ids >= 0)
+        # Адрес не должен считаться от -1, даже под маской.
+        safe_ids = tl.where(row_valid, sparse_ids, 0)
+
+        src_rows = src_base + safe_ids * stride_st2
+        dst_rows = dst_base + rows * stride_dsbs
+
+        for idx_sub_Dv in range(0, D_loop_times):
+            offs_sub_Dv = idx_sub_Dv * BLOCK_D_VEC + tl.arange(0, BLOCK_D_VEC)
+            mask_sub_Dv = offs_sub_Dv < D
+            tile_mask = row_valid[:, None] & mask_sub_Dv[None, :]
+
+            gather_tile = tl.load(
+                src_ptr + src_rows[:, None] + offs_sub_Dv[None, :] * stride_sd,
+                mask=tile_mask,
+                other=0,
+            )
+            tl.store(
+                dst_ptr + dst_rows[:, None] + offs_sub_Dv[None, :] * stride_dd,
+                gather_tile,
+                mask=tile_mask,
+            )
 
 @triton.jit(do_not_specialize=["T1", "T2", "S1", "S2"])
 def sparse_flash_attention_prefill_kernel(
