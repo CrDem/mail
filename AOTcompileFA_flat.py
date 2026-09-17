@@ -332,6 +332,19 @@ def _vdv_atn_fwd_l1buf(Q, K, V, ATTEN_MASK, M, Out, sm_scale: tl.constexpr,  #
 # =============================================================================
 PIPE = al.PIPE
 
+from triton.language.core import builtin as _tl_builtin
+
+
+@_tl_builtin
+def _copy_tensor_to_buffer(src, dst, _semantic=None):
+    """hivm.hir.copy ins(tensor) outs(buffer) — ровно та форма, которую ssbuf вставляет для V -> L1.
+
+    al.copy принимает только buffer -> buffer: bl.to_buffer(tensor, UB) даёт memref без address space
+    (ассерт MarkStrideAlign noNeedAlign), а hivm.copy с memref-входом ломает TileAndBindSubBlock
+    ("Copy input memref is not supported"). Билдер create_copy_buffer тензорный src допускает.
+    """
+    _semantic.builder.create_copy_buffer(src.handle, dst.handle)
+
 
 @triton.jit
 def _vdv_atn_fwd_cv(Q, K, V, ATTEN_MASK, M, Out, sm_scale: tl.constexpr,  #
@@ -493,15 +506,14 @@ def _vdv_atn_fwd_cv(Q, K, V, ATTEN_MASK, M, Out, sm_scale: tl.constexpr,  #
                 l_i = l_i * alpha + l_ij
                 # P -> fractal zN [K1, M1, 16, 16] -> L1 для mm2
                 p_nz = tl.reshape(tl.permute(tl.reshape(p, (BLOCK_M, K1, 16)), (1, 0, 2)), (K1, M1, 16, 16))
-                p_ub = bl.to_buffer(p_nz, al.ascend_address_space.UB)
                 if s % 2 == 0:
                     al.sync_block_wait("cube", "vector", 1, PIPE.PIPE_M, PIPE.PIPE_MTE3)
-                    al.copy(p_ub, p_l1_0)
+                    _copy_tensor_to_buffer(p_nz, p_l1_0)
                     al.sync_block_set("vector", "cube", 1, PIPE.PIPE_MTE3, PIPE.PIPE_MTE1)
                     al.sync_block_set("vector", "cube", 2, PIPE.PIPE_V, PIPE.PIPE_FIX)
                 else:
                     al.sync_block_wait("cube", "vector", 4, PIPE.PIPE_M, PIPE.PIPE_MTE3)
-                    al.copy(p_ub, p_l1_1)
+                    _copy_tensor_to_buffer(p_nz, p_l1_1)
                     al.sync_block_set("vector", "cube", 4, PIPE.PIPE_MTE3, PIPE.PIPE_MTE1)
                     al.sync_block_set("vector", "cube", 5, PIPE.PIPE_V, PIPE.PIPE_FIX)
             a2 = a1
