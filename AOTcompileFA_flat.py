@@ -154,8 +154,6 @@ def _vdv_atn_fwd_flat(Q, K, V, ATTEN_MASK, M, Out, sm_scale: tl.constexpr,  #
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-    q = tl.zeros([BLOCK_M, HEAD_DIM], dtype=Q.dtype.element_ty)
-    m_i_init = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
 
     for step_idx in tl.range(0, total_steps, 1):
         task = step_idx // NUM_S2_STEPS
@@ -168,12 +166,15 @@ def _vdv_atn_fwd_flat(Q, K, V, ATTEN_MASK, M, Out, sm_scale: tl.constexpr,  #
         off_h = task_hz_idx % H
         qvk_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
 
-        # ---- пролог S1-блока: Q грузится один раз на блок и дальше переиспользуется
-        if s2_idx == 0:
-            Q_block_ptr = tl.make_block_ptr(
-                base=Q + qvk_offset, shape=(N_CTX, HEAD_DIM), strides=(stride_qm, stride_qk),
-                offsets=(task_m_idx * BLOCK_M, 0), block_shape=(BLOCK_M, HEAD_DIM), order=(1, 0))
-            q = tl.load(Q_block_ptr)
+        # ---- Q грузится на каждом S2-шаге.
+        # Условная загрузка (if s2_idx == 0) с переносом q через итерации
+        # классифицируется pipeline-проходом как VECTOR: Vector каждый шаг
+        # перекладывает Q в NZ и копирует в L1, а Cube ждёт Vector перед mm1.
+        # Безусловный load классифицируется как CUBE (как K).
+        Q_block_ptr = tl.make_block_ptr(
+            base=Q + qvk_offset, shape=(N_CTX, HEAD_DIM), strides=(stride_qm, stride_qk),
+            offsets=(task_m_idx * BLOCK_M, 0), block_shape=(BLOCK_M, HEAD_DIM), order=(1, 0))
+        q = tl.load(Q_block_ptr)
 
         # ---- mm1
         K_block_ptr = tl.make_block_ptr(
@@ -183,7 +184,12 @@ def _vdv_atn_fwd_flat(Q, K, V, ATTEN_MASK, M, Out, sm_scale: tl.constexpr,  #
         qk = tl.dot(q, tl.trans(k))
 
         # ---- softmax (сброс состояния на первом S2-шаге блока)
-        m_i = tl.where(s2_idx == 0, m_i_init, m_i)
+        # Без tl.where: where со скалярным условием опускается в extract/insert_slice
+        # с динамической формой, и dynamic CV pipeline падает (AllocMultiCache).
+        # Прибавляем огромный отрицательный сдвиг только на s2_idx == 0:
+        # m_ij = max(qk), alpha = exp(-3e38 - m_ij) = 0 => l_i = l_ij, acc = pv.
+        is_block_start = (s2_idx == 0).to(tl.float32)
+        m_i = m_i + is_block_start * -3.0e38
         qk = qk * sm_scale
         m_ij = tl.maximum(m_i, tl.max(qk, 1, propagate_nan=True), propagate_nan=tl.PropagateNan.ALL)
         qk = qk - m_ij[:, None]
