@@ -7,12 +7,31 @@ AOT-компиляция Triton-кернела ДО TTIR (без NPU/GPU, тол
 на ядро (пролог/эпилог конвейера один раз, соседние S1-блоки перекрываются
 на глубину конвейера, как в Process() NPU-реализации FA).
 
-KERNEL = "flat" -> _vdv_atn_fwd_flat (новый)
-KERNEL = "orig" -> _vdv_atn_fwd      (исходный, конвейер на каждый S1-блок)
+KERNEL = "orig"  -> _vdv_atn_fwd       (исходный, конвейер на каждый S1-блок) — РАБОЧИЙ, ~0.15 c
+KERNEL = "flat"  -> _vdv_atn_fwd_flat  (эксперимент, ~0.223 c — медленнее, см. ниже)
+KERNEL = "l1buf" -> _vdv_atn_fwd_l1buf (идея 2: плоский цикл, Q в явном L1-буфере раз на блок;
+                                        ssbuf отключается сам из-за scope; CV-разбиение делает bishengir)
+KERNEL = "cv"    -> _vdv_atn_fwd_cv    (идея 3: ручной CV-кернел как NPU Process — два scope,
+                                        сдвиг стадий C1(t)/V1(t-1)/C2(t-2)/V2(t-3), токены на буферы,
+                                        слив 3 итерации на ядро). Компилировать с
+                                        disable_auto_inject_block_sync=True, enable_mixed_cv=True,
+                                        set_workspace_multibuffer=0 (как ssbuf компилирует свой вывод).
+
+Почему flat медленнее: dynamic CV pipeline не умеет держать Q в L1 весь блок при
+плоском цикле. Любая загрузка Q, которая перезагружается внутри цикла и переносится
+через итерации (if s2==0 / перезагрузка на последнем шаге), классифицируется как
+VECTOR (OpClassifier::patternMatchCUBE не проходит через результат scf.if), и Vector
+каждый шаг копирует Q в L1. Безусловная загрузка на Cube = +1 копия 32KB из GM на
+каждый S2-шаг: GM-трафик Cube 96KB/шаг вместо 64KB (x1.5, совпадает с 0.223/0.15).
+Экономия на прологе/эпилоге конвейера ~3/64 блока, на порядок меньше этой потери.
+Main loop прохода — всегда самый внутренний цикл с межъядерными передачами
+(MarkMainLoop), поэтому при двухуровневых циклах конвейер строится на внутреннем.
 """
 
 import triton
 import triton.language as tl
+import triton.extension.buffer.language as bl
+import triton.language.extra.cann.extension as al
 from triton._C.libtriton import ir
 from triton.backends.compiler import GPUTarget
 
@@ -22,7 +41,7 @@ from triton.backends.ascend.compiler import (
     ttir_to_linalg,
 )
 
-KERNEL = "flat"
+KERNEL = "orig"
 
 
 # =============================================================================
@@ -218,6 +237,309 @@ def _vdv_atn_fwd_flat(Q, K, V, ATTEN_MASK, M, Out, sm_scale: tl.constexpr,  #
             tl.store(O_block_ptr, (acc / l_i[:, None]).to(Out.type.element_ty))
 
 
+# =============================================================================
+# Идея 2: плоский цикл, Q блока в явном L1-буфере (запись раз на блок через bind_buffer)
+# =============================================================================
+@triton.jit
+def _vdv_atn_fwd_l1buf(Q, K, V, ATTEN_MASK, M, Out, sm_scale: tl.constexpr,  #
+              stride_qz: tl.constexpr, stride_qh: tl.constexpr, stride_qm: tl.constexpr, stride_qk: tl.constexpr,  #
+              stride_kz: tl.constexpr, stride_kh: tl.constexpr, stride_kn: tl.constexpr, stride_kk: tl.constexpr,  #
+              stride_vz: tl.constexpr, stride_vh: tl.constexpr, stride_vn: tl.constexpr, stride_vk: tl.constexpr,  #
+              stride_oz: tl.constexpr, stride_oh: tl.constexpr, stride_om: tl.constexpr, stride_on: tl.constexpr,  #
+              stride_am: tl.constexpr,
+              Z: tl.constexpr,
+              H: tl.constexpr,
+              N_CTX: tl.constexpr,  #
+              HEAD_DIM: tl.constexpr,  #
+              BLOCK_M: tl.constexpr,  #
+              BLOCK_N: tl.constexpr,  #
+              STAGE: tl.constexpr,  #
+              NUM_BLOCKS_PER_CORE: tl.constexpr,
+              NUM_BLOCKS: tl.constexpr,
+              NUM_BLOCKS_M: tl.constexpr,
+              AICORE_NUM: tl.constexpr,
+              ):
+    pid = tl.program_id(0)
+    NUM_S2_STEPS = N_CTX // BLOCK_N
+    LAST_S2_STEP = NUM_S2_STEPS - 1
+    num_tasks = (NUM_BLOCKS - pid + AICORE_NUM - 1) // AICORE_NUM
+    total_steps = num_tasks * NUM_S2_STEPS
+
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    # Q блока живёт в явном L1-буфере: пишем в него раз на блок, читаем каждый шаг.
+    q_l1 = bl.alloc(tl.float16, [BLOCK_M, HEAD_DIM], al.ascend_address_space.L1)
+
+    for step_idx in tl.range(0, total_steps, 1):
+        task = step_idx // NUM_S2_STEPS
+        s2_idx = step_idx % NUM_S2_STEPS
+        block_idx = pid + task * AICORE_NUM
+        task_hz_idx = block_idx // NUM_BLOCKS_M
+        task_m_idx = block_idx % NUM_BLOCKS_M
+        qvk_offset = (task_hz_idx // H).to(tl.int64) * stride_qz + (task_hz_idx % H).to(tl.int64) * stride_qh
+
+        # Загрузка Q явно на Cube. Любой scope.scope отключает ssbuf (PreCheckBlacklist):
+        # с ssbuf этот вариант некорректен (запись в q_l1 уходит на Vector в отдельный буфер).
+        with al.scope(core_mode="cube"):
+            if s2_idx == 0:
+                Q_block_ptr = tl.make_block_ptr(
+                    base=Q + qvk_offset, shape=(N_CTX, HEAD_DIM), strides=(stride_qm, stride_qk),
+                    offsets=(task_m_idx * BLOCK_M, 0), block_shape=(BLOCK_M, HEAD_DIM), order=(1, 0))
+                q_new = tl.load(Q_block_ptr)
+                bl.to_buffer(tensor=q_new, bind_buffer=q_l1)
+        q = bl.to_tensor(q_l1)
+
+        K_block_ptr = tl.make_block_ptr(
+            base=K + qvk_offset, shape=(N_CTX, HEAD_DIM), strides=(stride_kn, stride_kk),
+            offsets=(s2_idx * BLOCK_N, 0), block_shape=(BLOCK_N, HEAD_DIM), order=(1, 0))
+        k = tl.load(K_block_ptr)
+        qk = tl.dot(q, tl.trans(k))
+
+        is_block_start = (s2_idx == 0).to(tl.float32)
+        m_i = m_i + is_block_start * -3.0e38
+        qk = qk * sm_scale
+        m_ij = tl.maximum(m_i, tl.max(qk, 1, propagate_nan=True), propagate_nan=tl.PropagateNan.ALL)
+        qk = qk - m_ij[:, None]
+        p = tl.math.exp(qk)
+        p = p.cast(tl.float16)
+
+        V_block_ptr = tl.make_block_ptr(
+            base=V + qvk_offset, shape=(N_CTX, HEAD_DIM), strides=(stride_vn, stride_vk),
+            offsets=(s2_idx * BLOCK_N, 0), block_shape=(BLOCK_N, HEAD_DIM), order=(1, 0))
+        v = tl.load(V_block_ptr)
+        pv = tl.dot(p, v)
+
+        l_ij = tl.sum(p, 1)
+        alpha = tl.math.exp(m_i - m_ij)
+        m_i = m_ij
+        l_i = l_i * alpha + l_ij
+        acc = acc * alpha[:, None] + pv
+
+        if s2_idx == LAST_S2_STEP:
+            O_block_ptr = tl.make_block_ptr(
+                base=Out + qvk_offset, shape=(N_CTX, HEAD_DIM), strides=(stride_om, stride_on),
+                offsets=(task_m_idx * BLOCK_M, 0), block_shape=(BLOCK_M, HEAD_DIM), order=(1, 0))
+            tl.store(O_block_ptr, (acc / l_i[:, None]).to(Out.type.element_ty))
+
+
+# =============================================================================
+# Идея 3: ручной CV-кернел (как NPU FlashAttentionScoreKernelTrain::Process)
+# Cube:   итерация t -> mm1(t), mm2(t-2);  Vector: итерация t -> vec1(t-1), vec2(t-3)
+# Буферы и токены (флаги): P в L1 — 1/4, qk в UB — 2/5, pv в UB — 3/6 (пинг-понг по чётности шага).
+# Протокол повторяет рабочий вывод ssbuf для исходного кернела, но один конвейер на ядро.
+# =============================================================================
+PIPE = al.PIPE
+
+
+@triton.jit
+def _vdv_atn_fwd_cv(Q, K, V, ATTEN_MASK, M, Out, sm_scale: tl.constexpr,  #
+              stride_qz: tl.constexpr, stride_qh: tl.constexpr, stride_qm: tl.constexpr, stride_qk: tl.constexpr,  #
+              stride_kz: tl.constexpr, stride_kh: tl.constexpr, stride_kn: tl.constexpr, stride_kk: tl.constexpr,  #
+              stride_vz: tl.constexpr, stride_vh: tl.constexpr, stride_vn: tl.constexpr, stride_vk: tl.constexpr,  #
+              stride_oz: tl.constexpr, stride_oh: tl.constexpr, stride_om: tl.constexpr, stride_on: tl.constexpr,  #
+              stride_am: tl.constexpr,
+              Z: tl.constexpr,
+              H: tl.constexpr,
+              N_CTX: tl.constexpr,  #
+              HEAD_DIM: tl.constexpr,  #
+              BLOCK_M: tl.constexpr,  #
+              BLOCK_N: tl.constexpr,  #
+              STAGE: tl.constexpr,  #
+              NUM_BLOCKS_PER_CORE: tl.constexpr,
+              NUM_BLOCKS: tl.constexpr,
+              NUM_BLOCKS_M: tl.constexpr,
+              AICORE_NUM: tl.constexpr,
+              ):
+    pid = tl.program_id(0)
+    NUM_S2_STEPS: tl.constexpr = N_CTX // BLOCK_N
+    LAST_S2_STEP: tl.constexpr = N_CTX // BLOCK_N - 1
+    M1: tl.constexpr = BLOCK_M // 16
+    K1: tl.constexpr = BLOCK_N // 16
+    num_tasks = (NUM_BLOCKS - pid + AICORE_NUM - 1) // AICORE_NUM
+    total_steps = num_tasks * NUM_S2_STEPS
+    n_iters = total_steps + 3
+
+    # Межъядерные буферы: по два (пинг-понг по чётности S2-шага), как в DB-политиках NPU.
+    qk_ub0 = bl.alloc(tl.float32, [BLOCK_M, BLOCK_N], al.ascend_address_space.UB)
+    qk_ub1 = bl.alloc(tl.float32, [BLOCK_M, BLOCK_N], al.ascend_address_space.UB)
+    pv_ub0 = bl.alloc(tl.float32, [BLOCK_M, HEAD_DIM], al.ascend_address_space.UB)
+    pv_ub1 = bl.alloc(tl.float32, [BLOCK_M, HEAD_DIM], al.ascend_address_space.UB)
+    p_l1_0 = bl.alloc(tl.float16, [K1, M1, 16, 16], al.ascend_address_space.L1)
+    p_l1_1 = bl.alloc(tl.float16, [K1, M1, 16, 16], al.ascend_address_space.L1)
+
+    # ============================ CUBE ============================
+    # итерация t: mm1(t), mm2(t-2)
+    with al.scope(core_mode="cube"):
+        # Q блока: два L1-буфера по чётности блока (Q блока k+1 грузится, пока (k,63) ещё в конвейере)
+        q_l1_0 = bl.alloc(tl.float16, [BLOCK_M, HEAD_DIM], al.ascend_address_space.L1)
+        q_l1_1 = bl.alloc(tl.float16, [BLOCK_M, HEAD_DIM], al.ascend_address_space.L1)
+        # токены L1-буферов P свободны
+        al.sync_block_set("cube", "vector", 1, PIPE.PIPE_M, PIPE.PIPE_MTE3)
+        al.sync_block_set("cube", "vector", 4, PIPE.PIPE_M, PIPE.PIPE_MTE3)
+        for t in tl.range(0, n_iters, 1):
+            # ---------------- mm1(s = t) ----------------
+            s = t
+            if s < total_steps:
+                task = s // NUM_S2_STEPS
+                s2 = s % NUM_S2_STEPS
+                block_idx = pid + task * AICORE_NUM
+                hz = block_idx // NUM_BLOCKS_M
+                qvk_offset = (hz // H).to(tl.int64) * stride_qz + (hz % H).to(tl.int64) * stride_qh
+                if s2 == 0:
+                    Q_ptr = tl.make_block_ptr(
+                        base=Q + qvk_offset, shape=(N_CTX, HEAD_DIM), strides=(stride_qm, stride_qk),
+                        offsets=((block_idx % NUM_BLOCKS_M) * BLOCK_M, 0), block_shape=(BLOCK_M, HEAD_DIM),
+                        order=(1, 0))
+                    if task % 2 == 0:
+                        q_new0 = tl.load(Q_ptr)
+                        bl.to_buffer(tensor=q_new0, bind_buffer=q_l1_0)
+                    else:
+                        q_new1 = tl.load(Q_ptr)
+                        bl.to_buffer(tensor=q_new1, bind_buffer=q_l1_1)
+                if task % 2 == 0:
+                    q = bl.to_tensor(q_l1_0)
+                else:
+                    q = bl.to_tensor(q_l1_1)
+                K_ptr = tl.make_block_ptr(
+                    base=K + qvk_offset, shape=(N_CTX, HEAD_DIM), strides=(stride_kn, stride_kk),
+                    offsets=(s2 * BLOCK_N, 0), block_shape=(BLOCK_N, HEAD_DIM), order=(1, 0))
+                k = tl.load(K_ptr)
+                qk = tl.dot(q, tl.trans(k))
+                if s % 2 == 0:
+                    al.sync_block_wait("vector", "cube", 2, PIPE.PIPE_V, PIPE.PIPE_FIX)
+                    al.fixpipe(qk, qk_ub0)
+                    al.sync_block_set("cube", "vector", 2, PIPE.PIPE_FIX, PIPE.PIPE_V)
+                else:
+                    al.sync_block_wait("vector", "cube", 5, PIPE.PIPE_V, PIPE.PIPE_FIX)
+                    al.fixpipe(qk, qk_ub1)
+                    al.sync_block_set("cube", "vector", 5, PIPE.PIPE_FIX, PIPE.PIPE_V)
+            # ---------------- mm2(s = t - 2) ----------------
+            s = t - 2
+            if (s >= 0) & (s < total_steps):
+                task = s // NUM_S2_STEPS
+                s2 = s % NUM_S2_STEPS
+                block_idx = pid + task * AICORE_NUM
+                hz = block_idx // NUM_BLOCKS_M
+                qvk_offset = (hz // H).to(tl.int64) * stride_qz + (hz % H).to(tl.int64) * stride_qh
+                if s % 2 == 0:
+                    al.sync_block_wait("vector", "cube", 1, PIPE.PIPE_MTE3, PIPE.PIPE_MTE1)
+                    pf = bl.to_tensor(p_l1_0)
+                else:
+                    al.sync_block_wait("vector", "cube", 4, PIPE.PIPE_MTE3, PIPE.PIPE_MTE1)
+                    pf = bl.to_tensor(p_l1_1)
+                V_ptr = tl.make_block_ptr(
+                    base=V + qvk_offset, shape=(N_CTX, HEAD_DIM), strides=(stride_vn, stride_vk),
+                    offsets=(s2 * BLOCK_N, 0), block_shape=(BLOCK_N, HEAD_DIM), order=(1, 0))
+                v = tl.load(V_ptr)
+                pv = al.dot(pf, v, format_a="fractal", format_b="nd", format_c="nd")
+                if s % 2 == 0:
+                    al.sync_block_wait("vector", "cube", 3, PIPE.PIPE_V, PIPE.PIPE_FIX)
+                    al.fixpipe(pv, pv_ub0)
+                    al.sync_block_set("cube", "vector", 3, PIPE.PIPE_FIX, PIPE.PIPE_V)
+                    al.sync_block_set("cube", "vector", 1, PIPE.PIPE_M, PIPE.PIPE_MTE3)
+                else:
+                    al.sync_block_wait("vector", "cube", 6, PIPE.PIPE_V, PIPE.PIPE_FIX)
+                    al.fixpipe(pv, pv_ub1)
+                    al.sync_block_set("cube", "vector", 6, PIPE.PIPE_FIX, PIPE.PIPE_V)
+                    al.sync_block_set("cube", "vector", 4, PIPE.PIPE_M, PIPE.PIPE_MTE3)
+        # слив: дождаться возврата токенов UB-буферов
+        al.sync_block_wait("vector", "cube", 2, PIPE.PIPE_V, PIPE.PIPE_FIX)
+        al.sync_block_wait("vector", "cube", 5, PIPE.PIPE_V, PIPE.PIPE_FIX)
+        al.sync_block_wait("vector", "cube", 3, PIPE.PIPE_V, PIPE.PIPE_FIX)
+        al.sync_block_wait("vector", "cube", 6, PIPE.PIPE_V, PIPE.PIPE_FIX)
+
+    # =========================== VECTOR ===========================
+    # итерация t: vec1(t-1), vec2(t-3)
+    with al.scope(core_mode="vector"):
+        # токены UB-буферов свободны
+        al.sync_block_set("vector", "cube", 2, PIPE.PIPE_V, PIPE.PIPE_FIX)
+        al.sync_block_set("vector", "cube", 5, PIPE.PIPE_V, PIPE.PIPE_FIX)
+        al.sync_block_set("vector", "cube", 3, PIPE.PIPE_V, PIPE.PIPE_FIX)
+        al.sync_block_set("vector", "cube", 6, PIPE.PIPE_V, PIPE.PIPE_FIX)
+        m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+        l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+        acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+        zero_row = tl.zeros([BLOCK_M], dtype=tl.float32)
+        # сдвиговые регистры: alpha и l_i шага s нужны vec2 через 2 итерации
+        a0 = tl.zeros([BLOCK_M], dtype=tl.float32)
+        a1 = tl.zeros([BLOCK_M], dtype=tl.float32)
+        a2 = tl.zeros([BLOCK_M], dtype=tl.float32)
+        li0 = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+        li1 = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+        li2 = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+        for t in tl.range(0, n_iters, 1):
+            # ---------------- vec1(s = t - 1) ----------------
+            alpha = tl.zeros([BLOCK_M], dtype=tl.float32)
+            s = t - 1
+            if (s >= 0) & (s < total_steps):
+                s2 = s % NUM_S2_STEPS
+                if s % 2 == 0:
+                    al.sync_block_wait("cube", "vector", 2, PIPE.PIPE_FIX, PIPE.PIPE_V)
+                    qk = bl.to_tensor(qk_ub0)
+                else:
+                    al.sync_block_wait("cube", "vector", 5, PIPE.PIPE_FIX, PIPE.PIPE_V)
+                    qk = bl.to_tensor(qk_ub1)
+                is_block_start = (s2 == 0).to(tl.float32)
+                m_i = m_i + (zero_row + is_block_start) * -3.0e38
+                qk = qk * sm_scale
+                m_ij = tl.maximum(m_i, tl.max(qk, 1, propagate_nan=True), propagate_nan=tl.PropagateNan.ALL)
+                qk = qk - m_ij[:, None]
+                p = tl.math.exp(qk).cast(tl.float16)
+                l_ij = tl.sum(p, 1)
+                alpha = tl.math.exp(m_i - m_ij)
+                m_i = m_ij
+                l_i = l_i * alpha + l_ij
+                # P -> fractal zN [K1, M1, 16, 16] -> L1 для mm2
+                p_nz = tl.reshape(tl.permute(tl.reshape(p, (BLOCK_M, K1, 16)), (1, 0, 2)), (K1, M1, 16, 16))
+                p_ub = bl.to_buffer(p_nz, al.ascend_address_space.UB)
+                if s % 2 == 0:
+                    al.sync_block_wait("cube", "vector", 1, PIPE.PIPE_M, PIPE.PIPE_MTE3)
+                    al.copy(p_ub, p_l1_0)
+                    al.sync_block_set("vector", "cube", 1, PIPE.PIPE_MTE3, PIPE.PIPE_MTE1)
+                    al.sync_block_set("vector", "cube", 2, PIPE.PIPE_V, PIPE.PIPE_FIX)
+                else:
+                    al.sync_block_wait("cube", "vector", 4, PIPE.PIPE_M, PIPE.PIPE_MTE3)
+                    al.copy(p_ub, p_l1_1)
+                    al.sync_block_set("vector", "cube", 4, PIPE.PIPE_MTE3, PIPE.PIPE_MTE1)
+                    al.sync_block_set("vector", "cube", 5, PIPE.PIPE_V, PIPE.PIPE_FIX)
+            a2 = a1
+            a1 = a0
+            a0 = alpha
+            li2 = li1
+            li1 = li0
+            li0 = l_i
+            # ---------------- vec2(s = t - 3) ----------------
+            s = t - 3
+            if (s >= 0) & (s < total_steps):
+                task = s // NUM_S2_STEPS
+                s2 = s % NUM_S2_STEPS
+                if s % 2 == 0:
+                    al.sync_block_wait("cube", "vector", 3, PIPE.PIPE_FIX, PIPE.PIPE_V)
+                    pv = bl.to_tensor(pv_ub0)
+                else:
+                    al.sync_block_wait("cube", "vector", 6, PIPE.PIPE_FIX, PIPE.PIPE_V)
+                    pv = bl.to_tensor(pv_ub1)
+                acc = acc * a2[:, None] + pv
+                if s2 == LAST_S2_STEP:
+                    block_idx = pid + task * AICORE_NUM
+                    hz = block_idx // NUM_BLOCKS_M
+                    qvk_offset = (hz // H).to(tl.int64) * stride_qz + (hz % H).to(tl.int64) * stride_qh
+                    O_ptr = tl.make_block_ptr(
+                        base=Out + qvk_offset, shape=(N_CTX, HEAD_DIM), strides=(stride_om, stride_on),
+                        offsets=((block_idx % NUM_BLOCKS_M) * BLOCK_M, 0), block_shape=(BLOCK_M, HEAD_DIM),
+                        order=(1, 0))
+                    tl.store(O_ptr, (acc / li2[:, None]).to(Out.type.element_ty))
+                if s % 2 == 0:
+                    al.sync_block_set("vector", "cube", 3, PIPE.PIPE_V, PIPE.PIPE_FIX)
+                else:
+                    al.sync_block_set("vector", "cube", 6, PIPE.PIPE_V, PIPE.PIPE_FIX)
+        # слив: дождаться возврата токенов L1-буферов P
+        al.sync_block_wait("cube", "vector", 1, PIPE.PIPE_M, PIPE.PIPE_MTE3)
+        al.sync_block_wait("cube", "vector", 4, PIPE.PIPE_M, PIPE.PIPE_MTE3)
+
+
 def main():
     signature = {
         "Q": "*fp16",
@@ -324,15 +646,26 @@ def main():
 
     target = GPUTarget(backend="npu", arch="Ascend950PR_958b", warp_size=32)
     backend = AscendBackend(target)
-    options = backend.parse_options({"debug": True,
-                                     "compile_on_910_95": True,
-                                     "enable_dynamic_cv_pipeline": True,
-                                     "main_loop_unroll_factor": 1,
-                                     })
+    compile_opts = {"debug": True,
+                    "compile_on_910_95": True,
+                    "enable_dynamic_cv_pipeline": True,
+                    "main_loop_unroll_factor": 1,
+                    }
+    if KERNEL == "cv":
+        # синхронизации заданы вручную: автоинжект bishengir выключаем, как это делает ssbuf-флоу
+        compile_opts.update({"enable_dynamic_cv_pipeline": False,
+                             "disable_auto_inject_block_sync": True,
+                             "enable_mixed_cv": True,
+                             "set_workspace_multibuffer": 0})
+    elif KERNEL == "l1buf":
+        # с ssbuf этот вариант некорректен; scope внутри кернела и так отключает ssbuf (rc=2)
+        compile_opts["enable_dynamic_cv_pipeline"] = False
+    options = backend.parse_options(compile_opts)
     for key, value in vars(options).items():
         print(f"{key}: {value}")
 
-    kernel_fn = _vdv_atn_fwd_flat if KERNEL == "flat" else _vdv_atn_fwd
+    kernel_fn = {"orig": _vdv_atn_fwd, "flat": _vdv_atn_fwd_flat,
+                 "l1buf": _vdv_atn_fwd_l1buf, "cv": _vdv_atn_fwd_cv}[KERNEL]
     src = triton.compiler.ASTSource(
         fn=kernel_fn,
         signature=signature,
