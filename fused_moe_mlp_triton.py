@@ -66,10 +66,11 @@ def _fused_moe_mlp_kernel(
         hidden_tile = (silu_gate * acc_up).to(w2_ptr.dtype.element_ty)
 
         # gmm2
-        partial_out = tl.zeros((BLOCK_M, BLOCK_N2), dtype=tl.float32)
         for i in range(0, hidden_size, BLOCK_N2):
             offs_n2 = i + tl.arange(0, BLOCK_N2)
             n2_mask = offs_n2 < hidden_size
+
+            partial_out = tl.zeros((BLOCK_M, BLOCK_N2), dtype=tl.float32)
 
             w2_ptrs = (
                 w2_base + offs_n[:, None] * stride_w2_k + offs_n2[None, :] * stride_w2_n

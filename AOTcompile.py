@@ -3,40 +3,7 @@ AOT-компиляция Triton-кернела ДО TTIR (без NPU/GPU, тол
 плюс отдельная точка вызова backend-компилятора (ttir -> linalg).
 
 Идея: то, что обычно скрыто внутри triton.runtime.jit.JITFunction.run() /
-triton.compiler.compiler.compile(), здесь развёрнуто руками:
-
-  1. JITFunction (декоратор @triton.jit) сам по себе НИЧЕГО не компилирует.
-     Компиляция начинается только когда вызывают compile(ASTSource(...)),
-     либо когда JIT-функцию реально вызывают с конкретными аргументами
-     (тогда triton сам строит ASTSource на основе типов аргументов).
-
-  2. compile() внутри делает (см. add_stages backend-а):
-        ctx = ir.context()
-        ir.load_dialects(ctx)
-        backend.load_dialects(ctx)
-        module = src.make_ir(options, codegen_fns, module_map, ctx)   # AST -> "грязный" ttir
-        stages = {}
-        backend.add_stages(stages, options)   # {"ttir": make_ttir, "ttadapter": ttir_to_linalg, "npubin": ...}
-        module = stages["ttir"](module, metadata)        # <-- обычный, backend-agnostic TTIR
-        module = stages["ttadapter"](module, metadata)   # <-- ЭТО и есть "передать в backend-компилятор"
-        ...
-
-  Нам нужно остановиться сразу после шага "ttir" и вызвать "ttadapter"
-  отдельно, руками, когда сами решим.
-
-ВАЖНО (версионнозависимые места, проверьте под свой triton-ascend):
-  - Сигнатуры add_stages/make_ir/get_codegen_implementation могут отличаться
-    между версиями triton-core. Здесь используются сигнатуры ИЗ ВАШЕГО
-    файла triton/backends/ascend/compiler.py (2 аргумента в add_stages,
-    без `options` в get_codegen_implementation, 4 аргумента в make_ir).
-  - `NPUOptions.compile_on_910_95` в вашем файле берёт значение из
-    `triton.tools.get_ascend_devices.is_compile_on_910_95` — если это
-    функция, а не готовый bool, и она пытается спросить реальное
-    устройство при импорте модуля — на чисто-CPU машине это может
-    бросить исключение ещё на этапе `import`. Если увидите ошибку именно
-    на импорте `triton.backends.ascend.compiler` — сначала разберитесь
-    с этим импортом (замокать/поставить env-переменную), это не связано
-    с нашей логикой AOT.
+triton.compiler.compiler.compile(), здесь развёрнуто руками
 """
 
 import triton
@@ -52,18 +19,57 @@ from triton.backends.ascend.compiler import (
 )
 
 
-# ---------------------------------------------------------------------------
-# 1. Простейший тритон-кернел
-# ---------------------------------------------------------------------------
 @triton.jit
-def add_kernel(x_ptr, y_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    x = tl.load(x_ptr + offsets, mask=mask)
-    y = tl.load(y_ptr + offsets, mask=mask)
-    tl.store(out_ptr + offsets, x + y, mask=mask)
+def _matmul_activation_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    stride_am: tl.constexpr,
+    stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr,
+    stride_bn: tl.constexpr,
+    stride_cm: tl.constexpr,
+    stride_cn: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Получаем ID блоков
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Смещения для блоков
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    # Маски для границ
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    
+    # Аккумулятор
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Матричное умножение
+    for k in range(0, K, BLOCK_K):
+        # Загружаем A
+        a_ptrs = a_ptr + offs_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
+        a_tile = tl.load(a_ptrs, mask=mask_m[:, None] & ((k + offs_k) < K), other=0.0)
+        
+        # Загружаем B
+        b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn
+        b_tile = tl.load(b_ptrs, mask=((k + offs_k[:, None]) < K) & mask_n[None, :], other=0.0)
+        
+        # Умножаем
+        acc = tl.dot(a_tile, b_tile, acc)
+    
+    # Применяем активацию Swish (x * sigmoid(x))
+    result = acc * tl.sigmoid(acc)
+    
+    # Сохраняем результат
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, result, mask=mask_m[:, None] & mask_n[None, :])
 
 
 def main():
@@ -73,25 +79,49 @@ def main():
     #    Здесь мы задаём это руками, без единого реального тензора/девайса.
     # -----------------------------------------------------------------------
     signature = {
-        "x_ptr": "*fp32",
-        "y_ptr": "*fp32",
-        "out_ptr": "*fp32",
-        "n_elements": "i32",
-        "BLOCK_SIZE": "constexpr",
+        "a_ptr": "*fp32",           # матрица A [M, K]
+        "b_ptr": "*fp32",           # матрица B [K, N]
+        "c_ptr": "*fp32",           # матрица C [M, N] (результат)
+        "M": "constexpr",           # строки A
+        "N": "constexpr",           # столбцы B
+        "K": "constexpr",           # столбцы A / строки B
+        "stride_am": "constexpr",   # шаг по строкам A
+        "stride_ak": "constexpr",   # шаг по колонкам A
+        "stride_bk": "constexpr",   # шаг по строкам B
+        "stride_bn": "constexpr",   # шаг по колонкам B
+        "stride_cm": "constexpr",   # шаг по строкам C
+        "stride_cn": "constexpr",   # шаг по колонкам C
+        "BLOCK_M": "constexpr",     # размер блока по M
+        "BLOCK_N": "constexpr",     # размер блока по N
+        "BLOCK_K": "constexpr",     # размер блока по K
     }
-    constexprs = {"BLOCK_SIZE": 1024}
+
+    constexprs = {
+        "M": 1024,          # количество строк A
+        "N": 2048,          # количество столбцов B
+        "K": 4096,          # размерность внутреннего пространства
+        "stride_am": 4096,  # обычно равно K
+        "stride_ak": 1,
+        "stride_bk": 1,
+        "stride_bn": 1,
+        "stride_cm": 2048,  # обычно равно N
+        "stride_cn": 1,
+        "BLOCK_M": 64,      # оптимально подбирать под архитектуру GPU
+        "BLOCK_N": 128,     # обычно степень двойки: 64, 128, 256
+        "BLOCK_K": 64,      # обычно 32, 64, 128
+    }
 
     # "arch" здесь может быть произвольной строкой на этом этапе — она нужна
     # реальному bishengir-compile'у позже, а не фронтенду/пассам ttir.
-    target = GPUTarget(backend="npu", arch="ascend910b", warp_size=32)
+    target = GPUTarget(backend="npu", arch="ascend950pr", warp_size=32)
 
     backend = AscendBackend(target)
     options = backend.parse_options({})  # NPUOptions с дефолтами
 
     src = triton.compiler.ASTSource(
-        fn=add_kernel,          # именно JITFunction, не "голая" python-функция
+        fn=_matmul_activation_kernel,          # именно JITFunction, не "голая" python-функция
         signature=signature,
-        constexprs=constexprs,
+        constants=constexprs,
     )
 
     # -----------------------------------------------------------------------

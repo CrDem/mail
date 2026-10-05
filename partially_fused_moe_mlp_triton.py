@@ -5,23 +5,7 @@ import triton.language as tl
 
 @triton.jit
 def _locate_tile(pid_m, group_sizes_ptr, num_experts, BLOCK_M: tl.constexpr):
-    """
-    Given a global M-tile index `pid_m`, figure out on the fly:
-      - which expert this tile belongs to (expert_id)
-      - the starting row offset for this tile (row_start)
-      - how many valid rows it actually has, <= BLOCK_M (row_count)
 
-    This replaces the host-side build_tile_schedule() pass (cumsum +
-    searchsorted + several elementwise torch kernels, each with its own
-    launch overhead). Every program instead walks the small group_sizes
-    array once on-device. Same approach as the official Triton
-    grouped-gemm tutorial (persistent "which group am I in" loop).
-
-    Kept entirely in int32 inside the loop (group_sizes is forced to
-    int32 by the caller) so loop-carried variables have a consistent
-    dtype across iterations; only cast to int64 once at the very end,
-    right before it's used for pointer/stride arithmetic.
-    """
     running_tiles = 0
     running_rows = 0
 
@@ -50,9 +34,6 @@ def _locate_tile(pid_m, group_sizes_ptr, num_experts, BLOCK_M: tl.constexpr):
         running_tiles += tiles_e
         running_rows += gs
 
-    # tiles beyond the real schedule (pid_m >= total actual tiles, since the
-    # grid is only an upper bound) simply never hit -> row_count stays 0,
-    # caller does an early return, exactly like before.
     return expert_id.to(tl.int64), row_start.to(tl.int64), row_count.to(tl.int64)
 
 
