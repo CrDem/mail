@@ -108,7 +108,9 @@ def work_lines(named):
         num_tasks = int(named["NUM_TASKS"])
         has_full = bool(named["HAS_FULL_BLOCKS"])
     except Exception as exc:
-        return [f"work: unavailable ({type(exc).__name__}: {exc})"]
+        have = sorted(k for k in named if not k.startswith("arg"))
+        return [f"work: unavailable ({type(exc).__name__}: {exc})",
+                f"work: names seen = {have}"]
 
     q_mult = max(sparse_q // block_m, 1)
     kv_mult = max(sparse_kv // block_n, 1)
@@ -202,79 +204,169 @@ def emit(text, path=None, label="flex_attention_kernel"):
 # ---------------------------------------------------------------------------
 
 
-def install(path=None, limit=1, module=None):
-    """Patch flex_attention_kernel so the first `limit` launches are dumped.
+_patched_ids = set()
+_class_patched = False
+_in_launch = False
+_installing = False
 
-    `path` defaults to $FLEX_DUMP.  `limit=0` dumps every launch.
-    """
-    global _installed
-    if _installed:
+
+def _dump_once(arg_names, args, kwargs, path, limit, origin):
+    global _dumped
+    if limit and _dumped >= limit:
         return
-    path = path or os.environ.get("FLEX_DUMP") or None
-    if path and os.path.exists(path):
-        os.remove(path)
+    _dumped += 1
+    try:
+        text = format_call(arg_names, args, kwargs, kwargs.get("grid"))
+    except Exception as exc:
+        text = f"(dump failed: {type(exc).__name__}: {exc})"
+    emit(f"origin: {origin}" + chr(10) + text, path)
 
-    if module is None:
-        import importlib
-        importlib.import_module("mojo_opset.backends.ttx.kernels.npu")
-        module = importlib.import_module(
-            "mojo_opset.backends.ttx.kernels.npu.flex_attention")
 
-    kernel = getattr(module, "flex_attention_kernel")
-    arg_names = tuple(getattr(kernel, "arg_names", ()) or ())
+def _patch_instance(kernel, path, limit, origin):
+    """Wrap one JITFunction object's run()."""
+    if id(kernel) in _patched_ids or not hasattr(kernel, "run"):
+        return False
     original = kernel.run
+    names = tuple(getattr(kernel, "arg_names", ()) or ())
 
     def run(*args, **kwargs):
-        global _dumped
-        if limit == 0 or _dumped < limit:
-            _dumped += 1
-            try:
-                text = format_call(arg_names, args, kwargs, kwargs.get("grid"))
-            except Exception as exc:
-                text = f"(dump failed: {type(exc).__name__}: {exc})"
-            emit(text, path)
-        return original(*args, **kwargs)
+        global _in_launch
+        _in_launch = True
+        try:
+            _dump_once(names, args, kwargs, path, limit, origin)
+            return original(*args, **kwargs)
+        finally:
+            _in_launch = False
 
     kernel.run = run
-    _installed = True
-    print(f"[dump_flex_args] installed on {module.__name__}.flex_attention_kernel"
-          + (f", writing {path}" if path else ""))
+    _patched_ids.add(id(kernel))
+    return True
+
+
+def _patch_class(path, limit, kernel_name):
+    """Wrap JITFunction.run itself and filter by kernel name.
+
+    This is the primary hook: it does not care which arch module (a2 / a5 /
+    the dispatched public module) owns the kernel object.
+    """
+    global _class_patched
+    if _class_patched:
+        return False
+    try:
+        from triton.runtime.jit import JITFunction
+    except Exception:
+        return False
+    original = JITFunction.run
+
+    def run(self, *args, **kwargs):
+        if not _in_launch and getattr(self.fn, "__name__", "") == kernel_name:
+            origin = f"{getattr(self.fn, '__module__', '?')}.{kernel_name} [class hook]"
+            _dump_once(tuple(getattr(self, "arg_names", ()) or ()),
+                       args, kwargs, path, limit, origin)
+        return original(self, *args, **kwargs)
+
+    JITFunction.run = run
+    _class_patched = True
+    return True
+
+
+def _candidate_kernels(kernel_name):
+    """Every distinct kernel object reachable under that name, dispatched first."""
+    found = []
+    seen = set()
+    preferred = "mojo_opset.backends.ttx.kernels.npu.flex_attention"
+    names = [preferred] + [n for n in sorted(sys.modules)
+                           if n != preferred and n.endswith(".flex_attention")]
+    for name in names:
+        mod = sys.modules.get(name)
+        if mod is None:
+            continue
+        kernel = getattr(mod, kernel_name, None)
+        if kernel is None or id(kernel) in seen:
+            continue
+        seen.add(id(kernel))
+        found.append((name, kernel))
+    return found
+
+
+def install(path=None, limit=1, module=None, kernel_name="flex_attention_kernel"):
+    """Arm the dump on everything that could launch the kernel.
+
+    Patches JITFunction.run (arch-agnostic) plus every distinct kernel object
+    found, so it does not matter whether a2, a5 or the dispatched module is the
+    one actually used.  `limit=0` dumps every launch.
+    """
+    global _installed, _installing
+    if _installing:          # _patch_class imports triton, which re-enters the
+        return False         # import hook; ignore the nested call
+    path = path or os.environ.get("FLEX_DUMP") or None
+    if not _installed and path and os.path.exists(path):
+        os.remove(path)
+
+    _installing = True
+    try:
+        return _install_inner(path, limit, module, kernel_name)
+    finally:
+        _installing = False
+
+
+def _install_inner(path, limit, module, kernel_name):
+    global _installed
+    done = []
+    if _patch_class(path, limit, kernel_name):
+        done.append("triton.runtime.jit.JITFunction.run [class hook]")
+
+    if module is not None:
+        kernel = getattr(module, kernel_name, None)
+        if kernel is not None and _patch_instance(
+                kernel, path, limit, f"{module.__name__}.{kernel_name}"):
+            done.append(f"{module.__name__}.{kernel_name}")
+    else:
+        for name, kernel in _candidate_kernels(kernel_name):
+            if _patch_instance(kernel, path, limit, f"{name}.{kernel_name}"):
+                done.append(f"{name}.{kernel_name}")
+
+    if done:
+        _installed = True
+        for what in done:
+            print(f"[dump_flex_args] hooked {what}"
+                  + (f", writing {path}" if path else ""))
+    return bool(done)
 
 
 def install_deferred(path=None, limit=1, kernel_name="flex_attention_kernel"):
     """Arm the dump without importing anything.
 
-    Wraps builtins.__import__ and patches the kernel the moment the module that
-    owns it shows up in sys.modules.  Safe to call before torch / torch_npu /
-    triton exist, so it can run from a launcher ahead of the test.
+    Wraps builtins.__import__ and installs the hooks as soon as triton (and the
+    kernel modules) show up.  Safe to call before torch / torch_npu / triton
+    exist, so it can run from a launcher ahead of the test.
     """
     import builtins
 
-    state = {"done": False}
+    path = path or os.environ.get("FLEX_DUMP") or None
+    if path and os.path.exists(path):
+        os.remove(path)
+
     real_import = builtins.__import__
+    state = {"armed": True}
 
     def try_patch():
-        for name, mod in list(sys.modules.items()):
-            if mod is None or "flex_attention" not in name:
-                continue
-            kernel = getattr(mod, kernel_name, None)
-            if kernel is None or not hasattr(kernel, "run"):
-                continue
-            install(path, limit=limit, module=mod)
-            state["done"] = True
+        install(path, limit=limit, kernel_name=kernel_name)
+        # the class hook alone covers every arch module, so stop once it is in
+        if _class_patched and state["armed"]:
+            state["armed"] = False
             builtins.__import__ = real_import
-            return True
-        return False
 
     def hooked_import(name, *args, **kwargs):
         mod = real_import(name, *args, **kwargs)
-        if not state["done"] and ("flex_attention" in name or "mojo_opset" in name):
+        if state["armed"] and ("flex_attention" in name or "mojo_opset" in name
+                               or name == "triton" or name.startswith("triton.")):
             try_patch()
         return mod
 
     builtins.__import__ = hooked_import
-    print(f"[dump_flex_args] armed (deferred); will patch {kernel_name} on import"
-          + (f", writing {path}" if (path or os.environ.get('FLEX_DUMP')) else ""))
+    print(f"[dump_flex_args] armed (deferred) for {kernel_name}"
+          + (f", writing {path}" if path else ""))
 
 
 if os.environ.get("FLEX_DUMP_AUTO") == "1":
@@ -282,3 +374,44 @@ if os.environ.get("FLEX_DUMP_AUTO") == "1":
         install_deferred()
     except Exception as exc:
         print(f"[dump_flex_args] auto-arm failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# launcher mode: python dump_flex_args.py <target.py> [args...]
+# ---------------------------------------------------------------------------
+
+
+def _main(argv):
+    if len(argv) < 2:
+        print(__doc__)
+        print("usage: python dump_flex_args.py <target.py> [args...]")
+        return 2
+
+    import runpy
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+
+    install_deferred(os.environ.get("FLEX_DUMP"),
+                     limit=int(os.environ.get("FLEX_DUMP_LIMIT", "1")))
+
+    target = os.path.abspath(argv[1])
+    if not os.path.exists(target):
+        print(f"[dump_flex_args] target not found: {target}")
+        return 2
+    target_dir = os.path.dirname(target)
+    if target_dir not in sys.path:
+        sys.path.insert(0, target_dir)
+
+    sys.argv = [target] + list(argv[2:])
+    print(f"[dump_flex_args] running {target}")
+    runpy.run_path(target, run_name="__main__")
+    if _dumped == 0:
+        print("[dump_flex_args] WARNING: the kernel was never launched, or the "
+              "patch did not attach -- no dump was written")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv))
