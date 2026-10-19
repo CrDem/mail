@@ -340,7 +340,21 @@ def parse_args():
     ap.add_argument("--repo", default=os.environ.get("MOJO_OPSET_ROOT", ""),
                     help="directory containing the mojo_opset package")
     ap.add_argument("--dump-args", action="store_true",
-                    help="print every kernel argument before the launch")
+                    help="print every kernel argument at launch time, using the "
+                         "same formatter as dump_flex_args so the output is "
+                         "directly diffable against the mojo_opset run")
+    ap.add_argument("--dump-file", default=None, metavar="PATH",
+                    help="also write that dump to PATH (implies --dump-args)")
+    ap.add_argument("--us", type=float, default=None, metavar="T",
+                    help="a measured kernel duration in us (e.g. from msprof op); "
+                         "the script turns it into sustained TFLOPS so two runs "
+                         "can be compared on equal terms")
+    ap.add_argument("--via-impl", action="store_true",
+                    help="diagnostic A/B: move the block mask to the device and let "
+                         "flex_attention_fwd_impl build the args itself instead of "
+                         "calling the kernel directly.  Adds a couple of tiny host "
+                         "kernels (a zeros fill, maybe one add) -- in msprof look "
+                         "only at flex_attention_kernel's own duration")
     # compile options forwarded to the kernel
     ap.add_argument("--intra", type=int, default=3, help="intra_cache_num")
     ap.add_argument("--inter", type=int, default=2, help="inter_cache_num")
@@ -462,6 +476,30 @@ def main():
     grid, num_tasks = fa._persistent_launch_config(num_tasks_raw)
     print(f"[cpu ] grid={grid} num_tasks={num_tasks} (raw {num_tasks_raw})")
 
+    # ----- work accounting: makes any measured duration interpretable --------
+    # the kernel clamps each per-q-block count exactly like this
+    cap = max((kv_len + block_n - 1) // block_n, 1)
+    kv_mult = sparse_kv // block_n
+    part_per_qb = bm["kv_num_blks"].reshape(-1).clamp(max=cap // max(kv_mult, 1))
+    full_per_qb = bm["full_kv_num_blks"].reshape(-1).clamp(max=cap // max(kv_mult, 1))
+    visited_per_head = int((part_per_qb.sum() + full_per_qb.sum()) * kv_mult)
+    # two 128x128x128 matmuls per visited (q block, kv block) pair
+    gflop = visited_per_head * 2 * 2 * (block_m * block_n * head_dim) / 1e9 \
+        * batch * q_heads
+    total_pairs = visited_per_head * batch * q_heads
+    n_cores = grid[0]
+    print(f"[cpu ] work: visited (q,kv) block pairs per head = {visited_per_head} "
+          f"(partial {int(part_per_qb.sum())} + full {int(full_per_qb.sum())})")
+    print(f"[cpu ] work: total = {total_pairs} pairs = {gflop:.1f} GFLOP "
+          f"over Z*Hq={batch * q_heads} heads")
+    print(f"[cpu ] work: per core = {total_pairs / n_cores:.0f} pairs "
+          f"= {gflop / n_cores:.2f} GFLOP, {num_tasks / n_cores:.1f} tasks "
+          f"(cores={n_cores})")
+    if args.us:
+        print(f"[cpu ] work: {args.us:.1f} us for {gflop:.1f} GFLOP "
+              f"=> {gflop / (args.us * 1e-6) / 1e3:.1f} TFLOPS aggregate, "
+              f"{gflop / n_cores / (args.us * 1e-6) / 1e3:.2f} TFLOPS per core")
+
     # ===== stage 4: stage the inputs on the NPU ==============================
     t0 = time.time()
     dev = torch.device("npu")
@@ -485,39 +523,48 @@ def main():
     # ===== stage 5: compile options ==========================================
     copts = build_compile_options(args)
 
-    if args.dump_args:
-        print("[args] compile options:")
-        for key in sorted(copts):
-            print(f"         {key} = {copts[key]!r}")
-        print("[args] tensors:")
-        for name, tensor in (("Q", q), ("K", k), ("V", v),
-                             ("KV_NUM_BLKS", d_kv_num_blks),
-                             ("KV_IDX", d_kv_idx),
-                             ("FULL_KV_NUM_BLKS", d_full_kv_num_blks),
-                             ("FULL_KV_IDX", d_full_kv_idx),
-                             ("Q_TASK_IDS", d_q_task_ids),
-                             ("DENSE_MASK", d_dense_mask),
-                             ("PARTIAL_MASK_PACKED", d_packed),
-                             ("PARTIAL_MASK_OFFSETS", d_offsets),
-                             ("OUT", output), ("LSE", lse)):
-            print(f"         {name:21s} {str(tuple(tensor.shape)):26s} "
-                  f"{tensor.dtype} stride={tuple(tensor.stride())}")
-        print("[args] scalars:")
-        for name, val in (("SM_SCALE", sm_scale),
-                          ("QK_HEAD_DIM", head_dim), ("V_HEAD_DIM", v_head_dim),
-                          ("BLOCK_M", block_m), ("BLOCK_N", block_n),
-                          ("NUM_TASKS", num_tasks), ("NUM_Q_BLOCKS", num_q_blocks),
-                          ("Q_HEAD", q_heads),
-                          ("SPARSE_Q_BLOCK_SIZE", sparse_q),
-                          ("SPARSE_KV_BLOCK_SIZE", sparse_kv),
-                          ("Q_LEN", q_len), ("KV_LEN", kv_len),
-                          ("GQA_SHARED_HEADS", gqa),
-                          ("HAS_FULL_BLOCKS", True),
-                          ("USE_PACKED_PARTIAL_MASK", bm["use_packed_partial_mask"]),
-                          ("USE_Q_TASK_LIST", plan.use_q_task_list)):
-            print(f"         {name:24s} = {val!r}")
+    if args.dump_args or args.dump_file:
+        # Same formatter the mojo_opset side uses, so the two dumps diff cleanly.
+        try:
+            import dump_flex_args
+        except ImportError:
+            print("[args] dump_flex_args.py not found next to this script -- "
+                  "copy it alongside and retry")
+        else:
+            dump_flex_args.install(args.dump_file, limit=1, module=fa)
 
     # ===== stage 6: THE single launch ========================================
+    if args.via_impl:
+        # Diagnostic path: hand the device-side block mask to the real host
+        # wrapper and let it assemble the kernel arguments itself.  If this and
+        # the direct call below give the same duration, the direct call is a
+        # faithful reproduction of the production path.
+        for name in ("kv_num_blocks", "kv_indices",
+                     "full_kv_num_blocks", "full_kv_indices",
+                     "q_num_blocks", "q_indices",
+                     "full_q_num_blocks", "full_q_indices",
+                     "packed_partial_mask", "partial_mask_offsets",
+                     "partial_block_table"):
+            attr = getattr(block_mask, name, None)
+            if isinstance(attr, torch.Tensor):
+                setattr(block_mask, name, attr.to(dev))
+        # drop the CPU-built plan so the wrapper rebuilds it for the device
+        for name in ("_load_balance_plan_cache_key", "_load_balance_plan"):
+            if hasattr(block_mask, name):
+                delattr(block_mask, name)
+        print("[npu ] launching via flex_attention_fwd_impl (diagnostic A/B)")
+        t0 = time.time()
+        output, lse = fa.flex_attention_fwd_impl(q, k, v, block_mask)
+        torch.npu.synchronize()
+        print(f"[npu ] done (wall {time.time() - t0:.3f}s, includes JIT compile)")
+        if args.check:
+            ok = run_check(prob, output, lse, as_2d_mask_fn(mask_mod), sm_scale, gqa,
+                           num_q_blocks, block_m,
+                           args.check_heads, args.check_qblocks, args.check_chunk,
+                           args.rtol, args.atol)
+            return 0 if ok else 1
+        return 0
+
     print("[npu ] launching flex_attention_kernel -- 1 launch, no warm-up")
     t0 = time.time()
     fa.flex_attention_kernel[grid](
