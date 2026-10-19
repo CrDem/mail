@@ -183,8 +183,23 @@ def mask_mod_cross(problem):
     return mask_mod
 
 
+def mask_mod_blockdiag(problem):
+    """Causal inside each BLOCK_M-sized tile, nothing across tiles.
+
+    Reproduces the mask that test_flex_attention_mfu_ext.py hands to the
+    kernel: one partial kv block per q block, no full blocks, so the trip
+    counts come out as kv_num_blks=[1]*NQ and full_kv_num_blks=[0]*NQ.
+    """
+    tile = problem["tile"]
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        return ((q_idx // tile) == (kv_idx // tile)) & (q_idx >= kv_idx)
+    return mask_mod
+
+
 MASK_MODS = {
     "causal": mask_mod_causal,
+    "blockdiag": mask_mod_blockdiag,
     "full": mask_mod_full,
     "sparse": mask_mod_sparse,
     "cross": mask_mod_cross,
@@ -364,6 +379,10 @@ def parse_args():
     ap.add_argument("--opt", action="append", default=[], metavar="K=V",
                     help="extra compile option, repeatable "
                          "(e.g. --opt ub_multi_buffer_num=4)")
+    ap.add_argument("--mimic-ext", action="store_true",
+                    help="reproduce exactly what test_flex_attention_mfu_ext.py "
+                         "passes to the kernel: --mask blockdiag and no "
+                         "intra_cache_num / inter_cache_num")
     ap.add_argument("--bare", action="store_true",
                     help="pass no compile options at all (ignores --intra/--inter)")
     # correctness
@@ -392,6 +411,10 @@ def build_compile_options(args):
         enable_buffer_insert_optimization=True,
         enable_ub_refine_opt=True,
     )
+    if args.mimic_ext:
+        # the ext dump carries the other five options but not these two
+        copts.pop("intra_cache_num", None)
+        copts.pop("inter_cache_num", None)
     if args.ssbuf != "default":
         copts["enable_dynamic_cv_pipeline"] = (args.ssbuf == "on")
     for item in args.opt:
@@ -409,6 +432,8 @@ def build_compile_options(args):
 
 def main():
     args = parse_args()
+    if args.mimic_ext:
+        args.mask = "blockdiag"
 
     # ===== stage 0: imports ==================================================
     import torch_npu  # noqa: F401  registers the npu backend
@@ -436,8 +461,9 @@ def main():
 
     # ===== stage 2: block mask, on the CPU ===================================
     t0 = time.time()
-    mask_mod = MASK_MODS[args.mask](prob)
     block_m = block_n = fa.TILE_BLOCK_SIZE
+    prob["tile"] = block_m
+    mask_mod = MASK_MODS[args.mask](prob)
     block_mask = fa.create_block_mask_patched(
         mask_mod, B=1, H=1, Q_LEN=q_len, KV_LEN=kv_len,
         device="cpu", BLOCK_SIZE=(block_m, block_n),
