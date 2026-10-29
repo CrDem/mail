@@ -83,6 +83,22 @@ echo "=== TAG=$TAG  DEVICE_ID=$DEVICE_ID  AB_ROOT=$AB_ROOT ==="
 command -v bishengir-compile >/dev/null || { echo "НЕТ bishengir-compile в PATH"; exit 2; }
 python -c "import torch, torch_npu, triton" 2>/dev/null \
   || { echo "НЕ импортируются torch / torch_npu / triton -- окружение не готово"; exit 2; }
+python -c "import pytest" 2>/dev/null || { echo "НЕТ pytest"; exit 2; }
+
+# Реран-флаги их CI (--reruns/--only-rerun) -- это опции плагина
+# pytest-rerunfailures. Без плагина pytest падает на РАЗБОРЕ АРГУМЕНТОВ с rc=4,
+# то есть ни один тест не выполняется, а template.xml даёт "всё упало".
+# Поэтому флаги добавляем только если плагин есть.
+if python -c "import pytest_rerunfailures" 2>/dev/null; then
+  RERUN_OPTS=(--reruns 1 --reruns-delay 60
+              --only-rerun "Failed to start the device|out of memory")
+else
+  RERUN_OPTS=()
+  echo "ВНИМАНИЕ: нет pytest-rerunfailures -- реранов на флейки (device not started,"
+  echo "          out of memory) не будет. Такие падения придётся отличать руками."
+fi
+python -c "import transformers" 2>/dev/null \
+  || echo "ВНИМАНИЕ: нет transformers -- кейсы, которые его импортируют, упадут"
 
 rm -rf "$RUN_DIR"; mkdir -p "$LOG_DIR" "$CACHE_DIR" "$PERF_DIR"
 
@@ -171,8 +187,7 @@ while IFS= read -r line || [ -n "$line" ]; do
     TRITON_CACHE_DIR="$CACHE_DIR/$safe" \
     ASCEND_RT_VISIBLE_DEVICES="$npu_id" \
     MOJO_Backend="$MOJO_BACKEND" \
-    pytest -sv --reruns 1 --reruns-delay 60 \
-        --only-rerun "Failed to start the device|out of memory" \
+    pytest -sv ${RERUN_OPTS[@]+"${RERUN_OPTS[@]}"} \
         "$line" --junitxml="$test_xml" > "$test_log" 2>&1
     rc=$?
     echo "[done rc=$rc npu=$npu_id] $line"
